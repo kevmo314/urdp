@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>urdp</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<video id="video" autoplay playsinline muted disablepictureinpicture></video>
+<div id="gate" class="overlay">
+  <button id="start">Click to connect</button>
+  <p class="hint">Keyboard, mouse and audio are captured while the stream has focus.</p>
+</div>
+<div id="hud" hidden>
+  <div id="stats"></div>
+  <select id="sources" title="Source"></select>
+  <button id="fullscreen" title="Fullscreen (F11)">⛶</button>
+</div>
+<div id="status" class="toast" hidden></div>
+<script src="/assets/app.js" type="module"></script>
+</body>
+</html>

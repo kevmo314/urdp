@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev \
+            libx264-dev libopus-dev libpulse-dev xvfb xterm xdotool
+      - name: Vet
+        run: go vet ./...
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+      - name: Test
+        run: xvfb-run -a -s "-screen 0 1280x720x24" go test -race ./...
+      - name: Build
+        run: go build -o urdp .
+      - uses: actions/upload-artifact@v4
+        with:
+          name: urdp-linux-amd64
+          path: urdp
