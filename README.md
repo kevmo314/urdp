@@ -50,7 +50,9 @@ Every viewer of a source shares one capture→encode pipeline and one track. Aud
 
 Open `http://localhost:8000/?probe` on the machine being streamed, with the browser window visible on the captured screen. The page paints a binary timestamp in its corner and finds it again in the decoded video. The HUD then shows p50/p90 of how old each decoded frame is.
 
-That number covers the sender page's paint, capture, encode, network, decode, and the receiving page's next frame callback. On a 1080p Xvfb display, the total is about 50ms p50. Of that, only about 8–10ms is server-side capture and encode. The rest is the browser's own paint and present pipeline, counted on both ends.
+That number also includes the probe page's own rendering inside the browser on the host, which is usually a frame or two. To leave that out, run `scripts/xstamp.c` on the host, which draws the timestamp natively at the top-left of the screen, and open `/?probe=native`. On 1080p Xvfb at 60fps that measures **~21ms p50 / 24ms p90**: about 8ms for grab and encode, about 6ms waiting for the next 60fps capture slot (because xstamp changes the screen every millisecond), and about 8ms on the viewer for decode (~1ms) plus waiting for its next display refresh. Raising `-fps` above the viewer's refresh rate makes things worse, because Chrome then queues frames it can't present.
+
+The default probe covers the sender page's paint, capture, encode, network, decode, and the receiving page's next frame callback. On a 1080p Xvfb display, the total is about 50ms p50. Of that, only about 8–10ms is server-side capture and encode. The rest is the browser's own paint and present pipeline, counted on both ends.
 
 ## Building
 

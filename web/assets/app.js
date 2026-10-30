@@ -467,11 +467,17 @@ showTree();
 // the received video and reports how old the decoded picture is: the
 // capture → encode → network → decode latency, excluding display scan-out.
 
-const probe = new URLSearchParams(location.search).has('probe');
+// ?probe=native instead reads blocks some other program draws at the
+// screen's top-left using the wall clock (e.g. scripts/xstamp.c), which
+// leaves the page's own rendering out of the measurement.
+const probeMode = new URLSearchParams(location.search).get('probe');
+const probe = probeMode !== null;
+const nativeProbe = probeMode === 'native';
+const probeNow = () => Math.round(nativeProbe ? Date.now() : performance.now()) & 0xfff;
 const BITS = 12, CELL = 12; // CSS px per block
 let probeLatency = [];
 
-if (probe) {
+if (probe && !nativeProbe) {
   const c = document.createElement('canvas');
   c.width = BITS * CELL;
   c.height = CELL;
@@ -489,16 +495,18 @@ if (probe) {
     requestAnimationFrame(paint);
   };
   paint();
+}
 
+if (probe) {
   const sample = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
   sample.canvas.width = BITS;
   sample.canvas.height = 1;
   const read = () => {
     video.requestVideoFrameCallback(read);
     // Where the probe sits on the physical screen, in video pixels.
-    const dpr = devicePixelRatio;
-    const x0 = (screenX + (outerWidth - innerWidth) / 2) * dpr;
-    const y0 = (screenY + outerHeight - innerHeight) * dpr;
+    const dpr = nativeProbe ? 1 : devicePixelRatio;
+    const x0 = nativeProbe ? 0 : (screenX + (outerWidth - innerWidth) / 2) * dpr;
+    const y0 = nativeProbe ? 0 : (screenY + outerHeight - innerHeight) * dpr;
     const cell = CELL * dpr;
     // Sample the center of each block.
     for (let i = 0; i < BITS; i++) {
@@ -507,7 +515,7 @@ if (probe) {
     const px = sample.getImageData(0, 0, BITS, 1).data;
     let t = 0;
     for (let i = 0; i < BITS; i++) t = (t << 1) | (px[i * 4 + 1] > 128 ? 1 : 0);
-    const lat = ((Math.round(performance.now()) & 0xfff) - t + 0x1000) & 0xfff;
+    const lat = (probeNow() - t + 0x1000) & 0xfff;
     if (lat < 1000) probeLatency.push(lat);
   };
   video.requestVideoFrameCallback(read);
