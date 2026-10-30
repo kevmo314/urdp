@@ -46,6 +46,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Change detection | XDamage | DXGI / WGC frame events | SCFrameStatus |
 | Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | libx264 (static) | libx264 (static) |
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
+| Cursor shape | XFixes events | GetCursorInfo at 60 Hz | NSCursor.currentSystemCursor at 60 Hz |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
 | Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | built-in CoreAudio driver |
 | Viewer camera | PipeWire camera node (v4l2loopback fallback) | OBS Virtual Camera | — |
@@ -65,7 +66,7 @@ Every viewer of a source shares one capture→encode pipeline and one track. Aud
 - **Zero playout delay.** The server stamps every video packet with the `playout-delay` RTP header extension (min=max=0), and the client sets `jitterBufferTarget = 0`. Chrome then renders each frame as soon as it's decoded.
 - **Opus.** 10ms frames in `RESTRICTED_LOWDELAY` mode.
 - **Input channels.** Mouse moves use an unordered, no-retransmit data channel: a lost position is simply replaced by the next one. Buttons and keys use a reliable channel and carry their own coordinates. Keys are sent as physical key codes (`KeyboardEvent.code`).
-- **Local cursor.** The cursor is not captured. The browser's own pointer is the cursor, so it never lags.
+- **Local cursor.** The cursor is not captured. The browser's own pointer is the cursor, so it never lags. Host shape changes travel over the reliable input channel as CSS names or PNG images with hotspots; each viewer caches shapes by ID. PNGs retain host-pixel sizing, capped at 128 pixels. Windows reports cursor visibility; macOS visibility is best effort. X11 recognizes transparent cursor shapes as hidden, but XFixes does not expose visibility changes made with `XFixesHideCursor`.
 
 ### Measuring latency
 
@@ -80,7 +81,7 @@ The default probe covers the sender page's paint, capture, encode, network, deco
 ### Linux
 
 ```
-sudo apt install pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
+sudo apt install pkg-config libx11-dev libxfixes-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
   libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev libaom-dev libva-dev
 make            # bin/urdp
 make test

@@ -4,6 +4,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -63,6 +64,7 @@ type Config struct {
 	WindowIcon   func(id uint64, size int) (image.Image, error)
 	NewInjector  func() (input.Injector, error)
 	OpenAudio    func() (audio.Source, error)
+	WatchCursor  func(context.Context, func(capture.Cursor)) error
 
 	// Virtual devices fed by the viewer's microphone, webcam and gamepads.
 	OpenMicrophone func() (vdev.Microphone, error)
@@ -79,6 +81,11 @@ type Server struct {
 
 	injOnce sync.Once
 	inj     input.Injector
+
+	cursorOnce     sync.Once
+	cursorMu       sync.Mutex
+	cursorCurrent  *capture.Cursor
+	cursorSessions map[*session]bool
 
 	audioOnce  sync.Once
 	audioTrack *webrtc.TrackLocalStaticSample
@@ -108,6 +115,9 @@ func New(cfg Config) (*Server, error) {
 	}
 	if cfg.NewInjector == nil {
 		cfg.NewInjector = input.New
+	}
+	if cfg.WatchCursor == nil {
+		cfg.WatchCursor = capture.WatchCursor
 	}
 	if cfg.OpenAudio == nil {
 		cfg.OpenAudio = audio.Open
@@ -465,12 +475,13 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription, codec str
 		s.release(p)
 		return nil, err
 	}
-	sess := &session{p: p, pc: pc, usb: s.cfg.USB}
+	sess := &session{p: p, pc: pc, usb: s.cfg.USB, server: s}
 	closed := make(chan struct{})
 	var closeOnce sync.Once
 	cleanup := func() {
 		closeOnce.Do(func() {
 			close(closed)
+			s.removeCursorSession(sess)
 			sess.pads.close()
 			p.removeViewer(sess)
 			s.release(p)

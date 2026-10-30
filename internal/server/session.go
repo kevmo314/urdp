@@ -16,6 +16,10 @@ import (
 // (unordered, no retransmits, so a lost pointer position is simply
 // superseded by the next) and "input" (reliable, for buttons and keys).
 type session struct {
+	server       *Server
+	cursorIDs    map[uint64]bool
+	cursorClosed bool // protected by server.cursorMu
+
 	p  *pipeline
 	pc *webrtc.PeerConnection
 
@@ -42,6 +46,17 @@ func (s *session) onDataChannel(dc *webrtc.DataChannel) {
 		s.mu.Lock()
 		s.ctl = dc
 		s.mu.Unlock()
+		dc.OnOpen(func() {
+			if s.server != nil {
+				s.server.addCursorSession(s)
+			}
+		})
+		dc.OnClose(func() {
+			if s.server != nil {
+				s.server.removeCursorSession(s)
+			}
+			s.release()
+		})
 	}
 	dc.OnMessage(func(m webrtc.DataChannelMessage) {
 		s.mu.Lock()
@@ -53,7 +68,9 @@ func (s *session) onDataChannel(dc *webrtc.DataChannel) {
 			log.Printf("input: %v", err)
 		}
 	})
-	dc.OnClose(s.release)
+	if dc.Label() != "input" {
+		dc.OnClose(s.release)
+	}
 }
 
 // release lifts any keys or buttons this viewer still holds.
@@ -73,11 +90,15 @@ func (s *session) notify(dev, msg string) {
 
 func (s *session) send(msg string) {
 	s.mu.Lock()
-	dc := s.ctl
-	s.mu.Unlock()
-	if dc != nil {
-		_ = dc.SendText(msg)
+	defer s.mu.Unlock()
+	_ = s.sendLocked(msg)
+}
+
+func (s *session) sendLocked(msg string) error {
+	if s.ctl == nil {
+		return webrtc.ErrDataChannelNotOpen
 	}
+	return s.ctl.SendText(msg)
 }
 
 func isKeyframeRequest(p rtcp.Packet) bool {

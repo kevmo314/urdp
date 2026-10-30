@@ -46,10 +46,21 @@ async function negotiate(pc) {
   move = pc.createDataChannel('move', { ordered: false, maxRetransmits: 0 });
   move.bufferedAmountLowThreshold = 0;
   move.onbufferedamountlow = flushMove;
-  input.onmessage = (e) => {
+  const cursors = new Map();
+  let cursorUpdate = 0;
+  video.style.cursor = 'default';
+  input.onmessage = async (e) => {
     const m = JSON.parse(e.data);
     if (m.t === 'ended') sourceGone();
     if (m.t === 'notice') deviceNotice(m);
+    if (m.t === 'cursor') {
+      const update = ++cursorUpdate;
+      if (m.hidden) { video.style.cursor = 'none'; return; }
+      if (m.css) cursors.set(m.id, m.css);
+      if (m.png) cursors.set(m.id, imageCursor(m));
+      const cursor = await cursors.get(m.id);
+      if (update === cursorUpdate) video.style.cursor = cursor || 'default';
+    }
   };
 
   pc.ontrack = (e) => {
@@ -91,6 +102,27 @@ async function negotiate(pc) {
   if (res.status === 404) return sourceGone();
   if (!res.ok) throw new Error(await res.text());
   await pc.setRemoteDescription(await res.json());
+}
+
+// Keep host-pixel sizing unless it exceeds browsers' cursor image limit.
+function imageCursor(m) {
+  return new Promise((resolve) => {
+    const image = new Image();
+    image.onerror = () => resolve('default');
+    image.onload = () => {
+      const scale = Math.min(1, 128 / Math.max(image.width, image.height));
+      let url = image.src;
+      if (scale < 1) {
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+        url = canvas.toDataURL('image/png');
+      }
+      resolve(`url("${url}") ${Math.round((m.x || 0) * scale)} ${Math.round((m.y || 0) * scale)}, auto`);
+    };
+    image.src = `data:image/png;base64,${m.png}`;
+  });
 }
 
 function gatheringComplete(pc) {

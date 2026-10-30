@@ -16,7 +16,7 @@ jobs:
       - name: Install dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev libxrandr-dev \
+          sudo apt-get install -y pkg-config libx11-dev libxfixes-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev libxrandr-dev \
             libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev libaom-dev libva-dev xvfb xterm xdotool \
             pulseaudio pulseaudio-utils ffmpeg
       # The virtual device tests skip themselves if these fail.

@@ -106,15 +106,15 @@ static HICON window_icon(HWND hwnd, int size) {
     return best;
 }
 
-static HRESULT render_icon(HICON icon, int size, unsigned char *rgba) {
+static HRESULT render_icon(HICON icon, int width, int height, unsigned char *rgba) {
     HRESULT hr = E_FAIL;
     HDC dc = CreateCompatibleDC(NULL);
     if (!dc)
         return hr;
     BITMAPINFO bi = {0};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = size;
-    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biWidth = width;
+    bi.bmiHeader.biHeight = -height;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
@@ -125,9 +125,9 @@ static HRESULT render_icon(HICON icon, int size, unsigned char *rgba) {
         return E_OUTOFMEMORY;
     }
     HGDIOBJ old = SelectObject(dc, bitmap);
-    size_t bytes = (size_t)size * size * 4;
+    size_t bytes = (size_t)width * height * 4;
     memset(pixels, 0, bytes);
-    if (!DrawIconEx(dc, 0, 0, icon, size, size, 0, NULL, DI_NORMAL))
+    if (!DrawIconEx(dc, 0, 0, icon, width, height, 0, NULL, DI_NORMAL))
         goto done;
     GdiFlush();
     memcpy(rgba, pixels, bytes);
@@ -138,7 +138,7 @@ static HRESULT render_icon(HICON icon, int size, unsigned char *rgba) {
         // Legacy icons have no alpha. DI_MASK expands the AND mask to RGB:
         // white is transparent, black is opaque (including opaque black pixels).
         memset(pixels, 0, bytes);
-        if (!DrawIconEx(dc, 0, 0, icon, size, size, 0, NULL, DI_MASK))
+        if (!DrawIconEx(dc, 0, 0, icon, width, height, 0, NULL, DI_MASK))
             goto done;
         GdiFlush();
         for (size_t i = 0; i < bytes; i += 4)
@@ -178,9 +178,41 @@ long capture_icon(uint64_t id, int size, unsigned char *rgba) {
     }
     if (!icon)
         return HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
-    HRESULT hr = render_icon(icon, size, rgba);
+    HRESULT hr = render_icon(icon, size, size, rgba);
     // WM_GETICON and class icons are borrowed; only extracted icons are ours.
     if (owned)
         DestroyIcon(icon);
     return hr;
+}
+
+// Borrowed system cursor handles must never be destroyed.
+int capture_cursor(uint64_t *handle, int *showing, int *kind, int *w, int *h,
+                   int *x, int *y) {
+    CURSORINFO ci = {0};
+    ci.cbSize = sizeof(ci);
+    if (!GetCursorInfo(&ci)) return 0;
+    *handle = (uint64_t)(uintptr_t)ci.hCursor;
+    *showing = (ci.flags & CURSOR_SHOWING) != 0;
+    *kind = -1;
+    const WORD ids[] = {32512,32513,32514,32515,32516,32642,32643,32644,32645,32646,32648,32649,32650,32651};
+    for (int i = 0; i < (int)(sizeof(ids)/sizeof(ids[0])); i++) {
+        if (ci.hCursor == LoadCursorW(NULL, MAKEINTRESOURCEW(ids[i]))) { *kind = i; break; }
+    }
+    if (!*showing || *kind >= 0) return 1;
+    ICONINFO info = {0};
+    if (!GetIconInfo(ci.hCursor, &info)) return 0;
+    BITMAP bm = {0};
+    BOOL ok = GetObjectW(info.hbmColor ? info.hbmColor : info.hbmMask, sizeof(bm), &bm) != 0;
+    *w = bm.bmWidth;
+    *h = info.hbmColor ? bm.bmHeight : bm.bmHeight / 2;
+    *x = info.xHotspot; *y = info.yHotspot;
+    if (info.hbmColor) DeleteObject(info.hbmColor);
+    if (info.hbmMask) DeleteObject(info.hbmMask);
+    if (!ok || *w <= 0 || *h <= 0 || *w > 1024 || *h > 1024) return 0;
+
+    return 1;
+}
+
+int capture_cursor_render(uint64_t handle, int w, int h, unsigned char *rgba) {
+    return SUCCEEDED(render_icon((HICON)(uintptr_t)handle, w, h, rgba));
 }

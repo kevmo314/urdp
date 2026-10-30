@@ -2,6 +2,7 @@ package server
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"image"
@@ -67,8 +68,9 @@ func (s *toneSource) Close() error { return nil }
 func newTestServer(t *testing.T, inj *fakeInjector, opts ...func(*Config)) (*Server, *httptest.Server) {
 	t.Helper()
 	cfg := Config{
-		Encoder:    encoder.Options{FPS: 30},
-		OpenSource: func(string) (capture.Source, error) { return capture.NewTestSource(320, 240), nil },
+		Encoder:     encoder.Options{FPS: 30},
+		WatchCursor: func(context.Context, func(capture.Cursor)) error { return nil },
+		OpenSource:  func(string) (capture.Source, error) { return capture.NewTestSource(320, 240), nil },
 		ListWindows: func() ([]capture.Window, error) {
 			return []capture.Window{{ID: 0x1234, Title: "x", Width: 1, Height: 1}}, nil
 		},
