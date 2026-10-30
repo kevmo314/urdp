@@ -82,7 +82,9 @@ linux-release: $(LINUX_DEPS)/lib/libx264.a
 	@printf '%s\n' '#!/bin/sh' 'set -e' 'flags=$$(pkg-config "$$@")' \
 		'for l in $(LINUX_STATIC_LIBS); do' \
 		'  case " $$flags " in *" -l$$l "*) ;; *) continue;; esac' \
-		'  a=$$(pkg-config --variable=libdir $$l)/lib$$l.a; [ -f "$$a" ] || continue' \
+		'  a=$$(pkg-config --variable=libdir $$l)/lib$$l.a' \
+		'  [ -f "$$a" ] || a=$$($${CC:-cc} -print-file-name=lib$$l.a)' \
+		'  [ -f "$$a" ] || continue' \
 		'  priv=$$(pkg-config --static --libs-only-l $$l | sed "s|-l$$l\\b||")' \
 		'  flags=$$(printf "%s" "$$flags" | sed "s|-l$$l\\b|$$a $$priv|")' \
 		'done' \
