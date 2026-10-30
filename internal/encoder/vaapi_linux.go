@@ -801,8 +801,9 @@ import (
 )
 
 func init() {
-	Register(Backend{Name: "vaapi-h264", Codec: H264, Hardware: true, New: func(w, h int, o Options) (Encoder, error) { return newVAAPI(H264, w, h, o) }})
-	Register(Backend{Name: "vaapi-hevc", Codec: H265, Hardware: true, New: func(w, h int, o Options) (Encoder, error) { return newVAAPI(H265, w, h, o) }})
+	// Experimental: never run on a real GPU yet (see README).
+	Register(Backend{Name: "vaapi-h264", Codec: H264, Hardware: true, Experimental: true, New: func(w, h int, o Options) (Encoder, error) { return newVAAPI(H264, w, h, o) }})
+	Register(Backend{Name: "vaapi-hevc", Codec: H265, Hardware: true, Experimental: true, New: func(w, h int, o Options) (Encoder, error) { return newVAAPI(H265, w, h, o) }})
 }
 
 // vaapiDevice is the DRM render node to use: $URDP_VAAPI_DEVICE, else the

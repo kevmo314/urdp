@@ -75,6 +75,9 @@ type Backend struct {
 	Name     string
 	Codec    Codec
 	Hardware bool
+	// Experimental backends are only used when asked for by name, e.g.
+	// until they've been verified on real hardware.
+	Experimental bool
 	// New opens an encoder; it should fail fast if the hardware or driver
 	// is missing so the next backend can be tried.
 	New func(w, h int, o Options) (Encoder, error)
@@ -132,6 +135,9 @@ func Codecs(o Options) []Codec {
 }
 
 func allowed(b Backend, want string) bool {
+	if b.Experimental {
+		return b.Name == want
+	}
 	switch want {
 	case "":
 		return true
