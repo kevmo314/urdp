@@ -127,9 +127,12 @@ func TestStreamAndInput(t *testing.T) {
 			}
 			frame = append(frame, b...)
 			if pkt.Marker {
-				if bytes.Contains(frame, []byte{0, 0, 1, 0x65}) || bytes.Contains(frame, []byte{0, 0, 0, 1, 0x65}) {
-					close(gotIDR)
-					return
+				// nal_ref_idc varies by encoder; IDR is NAL type 5.
+				for _, nal := range bytes.Split(frame, []byte{0, 0, 1})[1:] {
+					if len(nal) > 0 && nal[0]&31 == 5 {
+						close(gotIDR)
+						return
+					}
 				}
 				frame = frame[:0]
 			}

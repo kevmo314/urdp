@@ -10,7 +10,8 @@ uint64_t ur_generation(void);
 void ur_wait(uint64_t, double);
 char *ur_list(int, char **);
 void *ur_open(uint32_t, int, char **);
-int ur_frame(void *, double, void **, int *, int *, int *, double *, char **);
+int ur_gpu_output(void *, int, char **);
+int ur_frame(void *, double, void **, void **, int *, int *, int *, double *, char **);
 void ur_close(void *);
 int ur_icon(uint32_t, int, unsigned char *);
 */
@@ -25,6 +26,10 @@ import (
 	"time"
 	"unsafe"
 )
+
+// DarwinPixelBuffer borrows a retained CVPixelBuffer until the source's next
+// Capture or Close. Consumers must finish using it before then.
+type DarwinPixelBuffer struct{ Pointer unsafe.Pointer }
 
 type darwinSource struct {
 	mu     sync.Mutex
@@ -88,11 +93,11 @@ func (s *darwinSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	if s.native == nil {
 		return nil, false, errors.New("capture closed")
 	}
-	var p unsafe.Pointer
+	var p, gpu unsafe.Pointer
 	var w, h, stride C.int
 	var r [4]C.double
 	var e *C.char
-	n := C.ur_frame(s.native, C.double(max(0, wait.Seconds())), &p, &w, &h, &stride, &r[0], &e)
+	n := C.ur_frame(s.native, C.double(max(0, wait.Seconds())), &p, &gpu, &w, &h, &stride, &r[0], &e)
 	if n == -2 {
 		return nil, false, ErrNotFound
 	}
@@ -100,13 +105,36 @@ func (s *darwinSource) Capture(wait time.Duration) (*Frame, bool, error) {
 		return nil, false, nativeError(e)
 	}
 	s.bounds = image.Rect(int(r[0]), int(r[1]), int(r[0]+r[2]), int(r[1]+r[3]))
-	if p == nil {
+	if p == nil && gpu == nil {
 		return nil, false, errors.New("ScreenCaptureKit has not delivered a frame")
 	}
-	s.frame = Frame{Pix: unsafe.Slice((*byte)(p), int(stride)*int(h)), Stride: int(stride), Width: int(w), Height: int(h)}
+	s.frame = Frame{Stride: int(stride), Width: int(w), Height: int(h)}
+	if gpu != nil {
+		s.frame.GPU = DarwinPixelBuffer{Pointer: gpu}
+	} else {
+		s.frame.Pix = unsafe.Slice((*byte)(p), int(stride)*int(h))
+	}
 	changed := n > 0 || s.first
 	s.first = false
 	return &s.frame, changed, nil
+}
+
+// SetGPUOutput changes SCK's output format and discards frames in the old format.
+func (s *darwinSource) SetGPUOutput(enabled bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.native == nil {
+		return errors.New("capture closed")
+	}
+	var e *C.char
+	var n C.int
+	if enabled {
+		n = 1
+	}
+	if C.ur_gpu_output(s.native, n, &e) != 0 {
+		return nativeError(e)
+	}
+	return nil
 }
 func (s *darwinSource) Bounds() image.Rectangle { s.mu.Lock(); defer s.mu.Unlock(); return s.bounds }
 func (s *darwinSource) WindowID() uint64        { return s.id }

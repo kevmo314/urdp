@@ -92,6 +92,7 @@ import (
 	"errors"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"time"
 	"unsafe"
@@ -132,6 +133,11 @@ var libavEncoders = []struct {
 func init() {
 	for _, e := range libavEncoders {
 		e := e
+		// On macOS the native vt-* backends cover VideoToolbox, with
+		// zero-copy capture; don't let these shadow them.
+		if runtime.GOOS == "darwin" && strings.HasSuffix(e.name, "_videotoolbox") {
+			continue
+		}
 		if C.avcodec_find_encoder_by_name(cstr(e.name)) == nil {
 			continue
 		}
