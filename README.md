@@ -6,6 +6,7 @@ A minimal, low-latency remote desktop that runs in the browser. It's a single Go
 ./urdp                 # serves http://<host>:8000
 ./urdp -addr :9000 -fps 60 -bitrate 20000
 ./urdp -list           # print capturable windows
+URDP_PASSWORD=hunter2 ./urdp -hosts desk.example.com   # require a password; allow that hostname
 ```
 
 - `http://host:8000/` streams the entire desktop.
@@ -31,6 +32,7 @@ Every viewer of a source shares one capture→encode pipeline and one track. Aud
 - **Event-driven capture.** Capture blocks on XDamage/DXGI until the screen actually changes, then grabs at once. Idle screens cost no encode or bandwidth. The FPS flag is only a cap.
 - **x264 `ultrafast` + `zerolatency`.** No B-frames, no lookahead, sliced threads, one frame in and one frame out. The profile is constrained baseline, so browsers can always hardware-decode it. A VBV cap bounds burst sizes. IDR frames are sent on PLI/FIR and when a viewer joins, plus every `-keyint` seconds.
 - **Fast BGRA→I420.** The conversion is vectorized and split across cores: about 0.6ms for a 1080p frame.
+- **Congestion control.** Per viewer, Google Congestion Control (GCC) estimates bandwidth from transport-wide-cc feedback, and the x264 VBV cap is reconfigured on the fly. When several viewers share a source, the slowest one sets the cap. There is no send-side pacer, since one would delay every frame. GCC can't distinguish an idle screen from a slow link, because its estimate never exceeds 1.5× what was received. So the cap follows GCC only while the stream is actually using the bandwidth or GCC sees congestion. In a test with a 4 Mbit/s link and a busy terminal, this cut latency from about 210ms to about 70ms.
 - **Zero playout delay.** The server stamps every video packet with the `playout-delay` RTP header extension (min=max=0), and the client sets `jitterBufferTarget = 0`. Chrome then renders each frame as soon as it's decoded.
 - **Opus.** 10ms frames in `RESTRICTED_LOWDELAY` mode.
 - **Input channels.** Mouse moves use an unordered, no-retransmit data channel: a lost position is simply replaced by the next one. Buttons and keys use a reliable channel and carry their own coordinates. Keys are sent as physical key codes (`KeyboardEvent.code`).
@@ -74,7 +76,11 @@ When running `urdp.exe` from WSL, Windows may ask whether to allow it through th
 
 ## Security
 
-**There is no authentication.** Anyone who can reach the port can see your screen and control your mouse and keyboard. Bind to localhost (`-addr 127.0.0.1:8000`) and tunnel over SSH or a VPN such as Tailscale, or put an authenticating proxy in front.
+Anyone who can reach the port can see your screen and control your mouse and keyboard.
+
+- Set `-password` (or `$URDP_PASSWORD`) to require HTTP basic auth. Browsers prompt for it, and any username works. Without TLS it is sent in the clear. For use beyond a trusted LAN, put the server behind an HTTPS reverse proxy, or bind to localhost (`-addr 127.0.0.1:8000`) and reach it over SSH or a VPN such as Tailscale.
+- The API rejects cross-site requests and any `Host` header that isn't an IP, `localhost`, or a name passed in `-hosts`. This stops other websites from driving it through your browser (CSRF and DNS rebinding).
+- A `/<window-id>` stream limits what is *shown*, not what can be *done*. Keyboard input and shortcuts still reach the whole desktop.
 
 ## Layout
 
