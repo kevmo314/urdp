@@ -10,7 +10,6 @@ import (
 
 	"github.com/pion/interceptor/pkg/cc"
 	"github.com/pion/rtp"
-	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/kevmo314/urdp/internal/capture"
@@ -22,6 +21,7 @@ import (
 type pipeline struct {
 	id    string
 	src   capture.Source
+	codec encoder.Codec
 	track *webrtc.TrackLocalStaticRTP
 	opts  encoder.Options
 
@@ -93,15 +93,16 @@ type pipelineStats struct {
 	BitrateKbps   int
 }
 
-func newPipeline(id string, src capture.Source, opts encoder.Options) (*pipeline, error) {
+func newPipeline(id string, c encoder.Codec, src capture.Source, opts encoder.Options) (*pipeline, error) {
+	v := lookupCodec(c)
 	track, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
+		webrtc.RTPCodecCapability{MimeType: v.mime, ClockRate: 90000, SDPFmtpLine: v.fmtp},
 		"video", "urdp-"+id)
 	if err != nil {
 		return nil, err
 	}
 	p := &pipeline{
-		id: id, src: src, track: track, opts: opts,
+		id: id, codec: c, src: src, track: track, opts: opts,
 		done: make(chan struct{}), stop: make(chan struct{}),
 		viewers: map[*session]*viewerRate{},
 	}
@@ -113,7 +114,7 @@ func (p *pipeline) run() {
 	defer close(p.done)
 	defer p.src.Close()
 
-	var enc *encoder.Encoder
+	var enc encoder.Encoder
 	defer func() {
 		if enc != nil {
 			enc.Close()
@@ -132,7 +133,7 @@ func (p *pipeline) run() {
 	// carries its own capture time as RTP timestamp. (The sample track
 	// advances the timestamp after a frame, which shifts idle gaps onto
 	// the wrong frame and inflates the receiver's jitter estimate.)
-	packetizer := rtp.NewPacketizer(1200, 0, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000)
+	packetizer := rtp.NewPacketizer(1200, 0, 0, lookupCodec(p.codec).payloader(), rtp.NewRandomSequencer(), 90000)
 	tsBase := rand.Uint32()
 
 	for {
@@ -183,7 +184,7 @@ func (p *pipeline) run() {
 		if enc == nil {
 			opts := p.opts
 			opts.BitrateKbps = kbps // keep the congestion-controlled cap
-			if enc, err = encoder.New(f.Width, f.Height, opts); err != nil {
+			if enc, err = encoder.New(p.codec, f.Width, f.Height, opts); err != nil {
 				log.Printf("source %s: %v", p.id, err)
 				enc = nil
 				continue

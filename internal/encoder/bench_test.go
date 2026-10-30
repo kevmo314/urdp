@@ -9,7 +9,7 @@ import (
 func BenchmarkEncode1080p(b *testing.B) {
 	src := capture.NewTestSource(1920, 1080)
 	f, _, _ := src.Capture(0)
-	enc, err := New(1920, 1080, Options{FPS: 60})
+	enc, err := newX264(1920, 1080, Options{FPS: 60})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -25,7 +25,7 @@ func BenchmarkEncode1080p(b *testing.B) {
 func BenchmarkConvert1080p(b *testing.B) {
 	src := capture.NewTestSource(1920, 1080)
 	f, _, _ := src.Capture(0)
-	enc, err := New(1920, 1080, Options{FPS: 60})
+	enc, err := newX264(1920, 1080, Options{FPS: 60})
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -39,7 +39,7 @@ func BenchmarkConvert1080p(b *testing.B) {
 // Content changes every frame (a moving gradient), like scrolling or video.
 func BenchmarkEncode1080pMotion(b *testing.B) {
 	src := capture.NewTestSource(1920, 1080)
-	enc, err := New(1920, 1080, Options{FPS: 60})
+	enc, err := newX264(1920, 1080, Options{FPS: 60})
 	if err != nil {
 		b.Fatal(err)
 	}

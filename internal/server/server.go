@@ -38,6 +38,9 @@ import (
 type Config struct {
 	WebFS   fs.FS
 	Encoder encoder.Options
+	// Codecs is the video codec preference when the viewer doesn't request
+	// one; nil means DefaultCodecs.
+	Codecs []encoder.Codec
 	// AudioKbps is the Opus bitrate; 0 disables audio.
 	AudioKbps int
 	// ICEServers are passed to the peer connection (e.g. STUN for NAT).
@@ -112,6 +115,9 @@ func New(cfg Config) (*Server, error) {
 		cfg.Encoder.FPS = 60
 	}
 
+	if cfg.Codecs == nil {
+		cfg.Codecs = DefaultCodecs
+	}
 	if cfg.Encoder.BitrateKbps <= 0 {
 		cfg.Encoder.BitrateKbps = 20000
 	}
@@ -170,15 +176,13 @@ func (s *Server) allowedRequest(r *http.Request) bool {
 func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 	m := &webrtc.MediaEngine{}
 	fb := []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}, {Type: "ccm", Parameter: "fir"}, {Type: "goog-remb"}, {Type: "transport-cc"}}
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType: webrtc.MimeTypeH264, ClockRate: 90000,
-			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42e01f",
-			RTCPFeedback: fb,
-		},
-		PayloadType: 102,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
-		return nil, nil, err
+	for _, v := range videoCodecs {
+		if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+			RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: v.mime, ClockRate: 90000, SDPFmtpLine: v.fmtp, RTCPFeedback: fb},
+			PayloadType:        v.pt,
+		}, webrtc.RTPCodecTypeVideo); err != nil {
+			return nil, nil, err
+		}
 	}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -187,13 +191,6 @@ func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
-		return nil, nil, err
-	}
-	// VP8 is only received: browsers send the viewer's webcam with it.
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
-		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, RTCPFeedback: fb},
-		PayloadType:        96,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, nil, err
 	}
 	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: PlayoutDelayURI}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -268,7 +265,7 @@ func (s *Server) handleWindows(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
 	host, _ := os.Hostname()
-	writeJSON(w, map[string]string{"hostname": host, "os": runtime.GOOS})
+	writeJSON(w, map[string]any{"hostname": host, "os": runtime.GOOS, "codecs": encoder.Codecs(s.cfg.Encoder)})
 }
 
 func (s *Server) handleDisplays(w http.ResponseWriter, r *http.Request) {
@@ -323,20 +320,23 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	out := map[string]any{}
 	for id, p := range s.pipelines {
-		out[id] = map[string]any{"viewers": p.refs, "stats": p.Stats(), "congestion": p.viewerStats()}
+		out[id] = map[string]any{"codec": p.codec, "viewers": p.refs, "stats": p.Stats(), "congestion": p.viewerStats()}
 	}
 	s.mu.Unlock()
 	writeJSON(w, out)
 }
 
-// acquire returns the running pipeline for id, starting one if needed.
-func (s *Server) acquire(id string) (*pipeline, error) {
+// acquire returns the running pipeline for source id in codec c, starting
+// one if needed. Viewers of the same source share it when they use the same
+// codec.
+func (s *Server) acquire(id string, c encoder.Codec) (*pipeline, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if p, ok := s.pipelines[id]; ok {
+	key := id + "@" + string(c)
+	if p, ok := s.pipelines[key]; ok {
 		select {
 		case <-p.done:
-			delete(s.pipelines, id) // source died; start fresh
+			delete(s.pipelines, key) // source died; start fresh
 		default:
 			p.refs++
 			p.keyframe.Store(true) // new viewer needs an IDR to start decoding
@@ -347,13 +347,13 @@ func (s *Server) acquire(id string) (*pipeline, error) {
 	if err != nil {
 		return nil, err
 	}
-	p, err := newPipeline(id, src, s.cfg.Encoder)
+	p, err := newPipeline(id, c, src, s.cfg.Encoder)
 	if err != nil {
 		src.Close()
 		return nil, err
 	}
 	p.refs = 1
-	s.pipelines[id] = p
+	s.pipelines[key] = p
 	return p, nil
 }
 
@@ -361,8 +361,8 @@ func (s *Server) release(p *pipeline) {
 	s.mu.Lock()
 	p.refs--
 	last := p.refs == 0
-	if last && s.pipelines[p.id] == p {
-		delete(s.pipelines, p.id)
+	if key := p.id + "@" + string(p.codec); last && s.pipelines[key] == p {
+		delete(s.pipelines, key)
 	}
 	s.mu.Unlock()
 	if last {
@@ -413,7 +413,7 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	id := strings.Trim(r.URL.Query().Get("source"), "/")
-	answer, err := s.negotiate(id, offer)
+	answer, err := s.negotiate(id, offer, r.URL.Query().Get("codec"))
 	if errors.Is(err, capture.ErrNotFound) {
 		http.Error(w, err.Error(), http.StatusNotFound)
 		return
@@ -427,8 +427,8 @@ func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
 
 // negotiate builds a peer connection for source id and returns the
 // complete answer (non-trickle: candidates are embedded in the SDP).
-func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.SessionDescription, error) {
-	p, err := s.acquire(id)
+func (s *Server) negotiate(id string, offer webrtc.SessionDescription, codec string) (*webrtc.SessionDescription, error) {
+	p, err := s.acquire(id, s.chooseCodec(offer.SDP, codec))
 	if err != nil {
 		return nil, fmt.Errorf("open source %q: %w", id, err)
 	}

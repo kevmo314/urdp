@@ -3,6 +3,7 @@ package encoder
 import (
 	"bytes"
 	"image"
+	"slices"
 	"testing"
 
 	"github.com/kevmo314/urdp/internal/capture"
@@ -22,7 +23,7 @@ func nalTypes(b []byte) []int {
 
 func TestEncodeKeyframes(t *testing.T) {
 	src := capture.NewTestSource(320, 240)
-	enc, err := New(320, 240, Options{FPS: 30})
+	enc, err := newX264(320, 240, Options{FPS: 30})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,7 +50,7 @@ func TestEncodeKeyframes(t *testing.T) {
 }
 
 func TestOddDimensions(t *testing.T) {
-	enc, err := New(321, 241, Options{})
+	enc, err := newX264(321, 241, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -73,7 +74,7 @@ func contains(s []int, v int) bool {
 }
 
 func TestConvertColors(t *testing.T) {
-	enc, err := New(64, 64, Options{})
+	enc, err := newX264(64, 64, Options{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,12 +118,12 @@ func TestDirtyConversion(t *testing.T) {
 	})
 	after.Dirty = []image.Rectangle{image.Rect(13, 7, 29, 20)}
 
-	partial, _ := New(w, h, Options{})
+	partial, _ := newX264(w, h, Options{})
 	defer partial.Close()
 	partial.Encode(before, 0, true)
 	partial.Encode(after, 33, false)
 
-	full, _ := New(w, h, Options{})
+	full, _ := newX264(w, h, Options{})
 	defer full.Close()
 	after.Dirty = nil
 	full.Encode(after, 0, true)
@@ -133,5 +134,51 @@ func TestDirtyConversion(t *testing.T) {
 		if !bytes.Equal(a, b) {
 			t.Fatalf("plane %d differs between dirty and full conversion", i)
 		}
+	}
+}
+
+// NV12 must match the I420 conversion: same luma, chroma interleaved.
+func TestNV12MatchesI420(t *testing.T) {
+	src := capture.NewTestSource(64, 48)
+	f, _, _ := src.Capture(0)
+	x, err := newX264(64, 48, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer x.Close()
+	x.convert(f)
+	n := NewNV12(64, 48)
+	n.Convert(f)
+	y, ys := x.plane(0)
+	u, us := x.plane(1)
+	v, vs := x.plane(2)
+	for j := 0; j < 48; j++ {
+		if !bytes.Equal(y[j*ys:j*ys+64], n.Y[j*n.YStride:j*n.YStride+64]) {
+			t.Fatalf("luma row %d differs", j)
+		}
+	}
+	for j := 0; j < 24; j++ {
+		for i := 0; i < 32; i++ {
+			if n.UV[j*n.UVStride+2*i] != u[j*us+i] || n.UV[j*n.UVStride+2*i+1] != v[j*vs+i] {
+				t.Fatalf("chroma (%d,%d) differs", i, j)
+			}
+		}
+	}
+}
+
+func TestBackendSelection(t *testing.T) {
+	if cs := Codecs(Options{}); !slices.Contains(cs, H264) {
+		t.Fatalf("codecs %v lack H264", cs)
+	}
+	e, err := New(H264, 320, 240, Options{Backend: "software"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer e.Close()
+	if e.Codec() != H264 {
+		t.Errorf("codec %s", e.Codec())
+	}
+	if _, err := New(H264, 320, 240, Options{Backend: "nonexistent"}); err == nil {
+		t.Error("expected an error for an unknown backend")
 	}
 }

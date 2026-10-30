@@ -82,7 +82,8 @@ async function negotiate(pc) {
 
   await pc.setLocalDescription(await pc.createOffer());
   await gatheringComplete(pc);
-  const res = await fetch(`/api/offer?source=${encodeURIComponent(source)}`, {
+  const codec = new URLSearchParams(location.search).get('codec') ?? '';
+  const res = await fetch(`/api/offer?source=${encodeURIComponent(source)}&codec=${encodeURIComponent(codec)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(pc.localDescription),
@@ -258,7 +259,8 @@ async function updateStats() {
     const dDec = v.framesDecoded - prev.framesDecoded;
     const dec = dDec > 0 ? ((v.totalDecodeTime - prev.totalDecodeTime) / dDec) * 1000 : 0;
     const rtt = pair?.currentRoundTripTime != null ? pair.currentRoundTripTime * 1000 : NaN;
-    lines.push(`${v.frameWidth}×${v.frameHeight} ${fps.toFixed(0)}fps ${mbps.toFixed(1)}Mbps`);
+    const codec = r.get(v.codecId)?.mimeType?.replace('video/', '') ?? '';
+    lines.push(`${codec} ${v.frameWidth}×${v.frameHeight} ${fps.toFixed(0)}fps ${mbps.toFixed(1)}Mbps`);
     lines.push(`rtt ${rtt.toFixed(0)}ms  jitbuf ${jb.toFixed(0)}ms  dec ${dec.toFixed(1)}ms  lost ${v.packetsLost}`);
   }
   prev = v;
@@ -383,6 +385,7 @@ async function loadTree() {
   const get = (u) => fetch(u).then((r) => (r.ok ? r.json() : [])).catch(() => []);
   let [info, displays, windows] = await Promise.all([get('/api/info'), get('/api/displays'), get('/api/windows')]);
   if (info.hostname) document.getElementById('host').textContent = info.hostname;
+  fillCodecs(info.codecs ?? []);
 
   const groups = new Map();
   // Tray stubs and helper windows are rarely worth streaming.
@@ -575,3 +578,21 @@ matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.('change',
 // Scrolling moves the video without resizing it.
 window.addEventListener('scroll', () => { videoRect = video.getBoundingClientRect(); }, { passive: true });
 applyScale();
+
+// ---- codec ----
+// The server picks the best codec both sides support; ?codec= asks for a
+// specific one.
+
+const codecEl = document.getElementById('codec');
+function fillCodecs(codecs) {
+  if (codecEl.options.length === codecs.length + 1) return;
+  const want = new URLSearchParams(location.search).get('codec')?.toUpperCase() ?? '';
+  codecEl.replaceChildren(new Option('auto', ''), ...codecs.map((c) => new Option(c, c)));
+  codecEl.value = codecs.includes(want) ? want : '';
+}
+codecEl.onchange = () => {
+  const q = new URLSearchParams(location.search);
+  if (codecEl.value) q.set('codec', codecEl.value); else q.delete('codec');
+  location.search = q.toString();
+};
+fetch('/api/info').then((r) => r.json()).then((i) => fillCodecs(i.codecs ?? [])).catch(() => {});

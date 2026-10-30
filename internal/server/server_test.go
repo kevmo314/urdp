@@ -9,6 +9,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -195,7 +196,7 @@ func TestStreamAndInput(t *testing.T) {
 	}
 
 	s.mu.Lock()
-	viewers := s.pipelines["test"].refs
+	viewers := s.pipelines["test@H264"].refs
 	s.mu.Unlock()
 	if viewers != 1 {
 		t.Errorf("viewers = %d, want 1", viewers)
@@ -462,5 +463,23 @@ func TestViewerDevices(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("gamepad not closed on unplug")
+	}
+}
+
+func TestChooseCodec(t *testing.T) {
+	s, _ := newTestServer(t, &fakeInjector{})
+	offer := "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\n" +
+		"m=video 9 UDP/TLS/RTP/SAVPF 96 102 45\r\na=rtpmap:96 VP8/90000\r\na=rtpmap:102 H264/90000\r\na=rtpmap:45 AV1/90000\r\n" +
+		"m=video 9 UDP/TLS/RTP/SAVPF 98\r\na=rtpmap:98 VP9/90000\r\n"
+	if got := offeredVideoCodecs(offer); !slices.Equal(got, []string{"VP8", "H264", "AV1"}) {
+		t.Fatalf("offered = %v", got)
+	}
+	if c := s.chooseCodec(offer, ""); c != encoder.H264 {
+		t.Errorf("default = %s, want H264", c)
+	}
+	// Requests for codecs the host can't encode (or the browser didn't
+	// offer) fall back to the preference order.
+	if c := s.chooseCodec(offer, "vp9"); c != encoder.H264 {
+		t.Errorf("unavailable request = %s, want H264", c)
 	}
 }

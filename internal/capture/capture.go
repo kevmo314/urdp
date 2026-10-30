@@ -20,6 +20,12 @@ type Frame struct {
 	// Dirty lists the regions that changed since the previous frame from
 	// the same source. nil means the whole frame may have changed.
 	Dirty []image.Rectangle
+	// GPU optionally carries a platform-specific handle to the frame still
+	// in GPU memory (e.g. a D3D11 texture or CVPixelBuffer). Hardware
+	// encoders that understand it can encode without a CPU readback; Pix
+	// may then be nil, so encoders that don't must not be paired with a
+	// source that omits Pix.
+	GPU any
 }
 
 // Source produces frames from the desktop or a single window.
