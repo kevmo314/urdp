@@ -49,18 +49,22 @@ func (s *windowsAudio) run(ready chan<- error) {
 	}
 	defer C.audio_close(native)
 	ready <- nil
-	next := time.Now()
+	const packetJitter = 2 * time.Millisecond
+	var lastData time.Time
 	for {
 		select {
 		case <-s.stop:
 			return
 		case req := <-s.requests:
 			duration := time.Duration(len(req.buf)/Channels) * time.Second / SampleRate
-			now := time.Now()
-			if now.Sub(next) > duration {
-				next = now
+			// A late engine packet must get a chance to arrive before we synthesize
+			// silence. A wall-clock schedule can put that packet behind padding.
+			deadline := time.Now().Add(duration)
+			// Allow small engine/event scheduling jitter after an active packet.
+			// Subsequent silent reads still wait one frame period.
+			if activeDeadline := lastData.Add(duration + packetJitter); activeDeadline.After(deadline) {
+				deadline = activeDeadline
 			}
-			next = next.Add(duration)
 			offset := 0
 			var err error
 			for {
@@ -71,23 +75,30 @@ func (s *windowsAudio) run(ready chan<- error) {
 					break
 				}
 				offset += int(written)
-				wait := time.Until(next)
+				if written > 0 {
+					lastData = time.Now()
+					deadline = lastData.Add(duration + packetJitter)
+				}
+				if offset == len(req.buf) {
+					break
+				}
+				wait := time.Until(deadline)
 				if wait <= 0 {
+					// The final poll above drains real samples before padding.
 					clear(req.buf[offset:])
 					break
 				}
-				if offset < len(req.buf) {
-					wait = min(wait, time.Millisecond)
-				}
-				timer := time.NewTimer(wait)
 				select {
-				case <-timer.C:
 				case <-s.stop:
-					timer.Stop()
 					req.result <- errors.New("audio closed")
 					return
+				default:
 				}
-				if offset == len(req.buf) {
+				// Bound the native wait so Close remains responsive, including
+				// when the render engine produces no loopback events in silence.
+				ms := (min(wait, 10*time.Millisecond) + time.Millisecond - 1) / time.Millisecond
+				if hr := C.audio_wait(native, C.uint(ms)); hr < 0 {
+					err = audioError(hr)
 					break
 				}
 			}

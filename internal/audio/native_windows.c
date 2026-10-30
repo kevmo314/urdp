@@ -24,6 +24,7 @@ struct audio_native {
     size_t allocated;
     UINT32 remaining;
     int com;
+    HANDLE event;
 };
 void audio_close(audio_native *s) {
     if (!s)
@@ -34,6 +35,8 @@ void audio_close(audio_native *s) {
         IAudioClient_Stop(s->client);
         IAudioClient_Release(s->client);
     }
+    if (s->event)
+        CloseHandle(s->event);
     free(s->storage);
     int com = s->com;
     free(s);
@@ -45,11 +48,11 @@ long audio_open(audio_native **out) {
     if (!s)
         return E_OUTOFMEMORY;
     HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    if (FAILED(hr)) {
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
         free(s);
         return hr;
     }
-    s->com = 1;
+    s->com = SUCCEEDED(hr);
     IMMDeviceEnumerator *enumerator = NULL;
     IMMDevice *device = NULL;
     hr = CoCreateInstance(&clsid_enumerator, NULL, CLSCTX_ALL, &iid_enumerator,
@@ -69,12 +72,31 @@ long audio_open(audio_native **out) {
     format.wBitsPerSample = 16;
     format.nBlockAlign = 4;
     format.nAvgBytesPerSec = 192000;
+    // Native event-driven loopback is supported starting with Windows 10 1703.
+    // Older systems retain timed polling; RtlGetVersion avoids manifest version lies.
+    typedef LONG(WINAPI * version_fn)(OSVERSIONINFOW *);
+    version_fn version = (version_fn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    OSVERSIONINFOW os = {0};
+    os.dwOSVersionInfoSize = sizeof(os);
+    DWORD event_flag = 0;
+    if (SUCCEEDED(hr) && version && version(&os) == 0 &&
+        (os.dwMajorVersion > 10 || (os.dwMajorVersion == 10 && os.dwBuildNumber >= 15063))) {
+        s->event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!s->event) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            audio_close(s);
+            return hr;
+        }
+        event_flag = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    }
     if (SUCCEEDED(hr))
         hr = IAudioClient_Initialize(s->client, AUDCLNT_SHAREMODE_SHARED,
-                                     AUDCLNT_STREAMFLAGS_LOOPBACK |
+                                     AUDCLNT_STREAMFLAGS_LOOPBACK | event_flag |
                                          AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
                                          AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY,
                                      200000, 0, &format, NULL);
+    if (SUCCEEDED(hr) && s->event)
+        hr = IAudioClient_SetEventHandle(s->client, s->event);
     if (SUCCEEDED(hr))
         hr = IAudioClient_GetService(s->client, &iid_capture, (void **)&s->capture);
     if (SUCCEEDED(hr))
@@ -139,4 +161,13 @@ long audio_poll(audio_native *s, int16_t *dst, unsigned capacity, unsigned *writ
         *written += frames * 2;
     }
     return S_OK;
+}
+
+long audio_wait(audio_native *s, unsigned timeout_ms) {
+    if (!s->event) {
+        Sleep(timeout_ms > 1 ? 1 : timeout_ms);
+        return S_OK;
+    }
+    DWORD result = WaitForSingleObject(s->event, timeout_ms);
+    return result == WAIT_FAILED ? HRESULT_FROM_WIN32(GetLastError()) : S_OK;
 }

@@ -4,7 +4,7 @@
 #include "wgc_windows.h"
 #include <d3d11.h>
 #include <dwmapi.h>
-#include <dxgi1_2.h>
+#include <dxgi1_5.h>
 #include <stdlib.h>
 #include <string.h>
 #include <windows.h>
@@ -61,6 +61,7 @@ static HRESULT desktop_init(capture_native *s) {
     IDXGIAdapter1 *adapter = NULL;
     IDXGIOutput *output = NULL;
     IDXGIOutput1 *output1 = NULL;
+    IDXGIOutput5 *output5 = NULL;
     HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
     if (FAILED(hr))
         return hr;
@@ -76,10 +77,20 @@ static HRESULT desktop_init(capture_native *s) {
                 s->rotation = desc.Rotation;
                 hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
                                        NULL, 0, D3D11_SDK_VERSION, &s->device, NULL, &s->context);
-                if (SUCCEEDED(hr))
-                    hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1, (void **)&output1);
-                if (SUCCEEDED(hr))
-                    hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown *)s->device, &s->dup);
+                if (SUCCEEDED(hr)) {
+                    hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput5, (void **)&output5);
+                    if (SUCCEEDED(hr)) {
+                        const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+                        hr = IDXGIOutput5_DuplicateOutput1(output5, (IUnknown *)s->device, 0, 1,
+                                                           &format, &s->dup);
+                    }
+                    if (FAILED(hr)) {
+                        hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1, (void **)&output1);
+                        if (SUCCEEDED(hr))
+                            hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown *)s->device, &s->dup);
+                    }
+                }
+                RELEASE(output5);
                 RELEASE(output1);
                 RELEASE(output);
                 RELEASE(adapter);
@@ -139,9 +150,9 @@ long capture_open(uint64_t hwnd, capture_native **out) {
     *out = s;
     return S_OK;
 }
-static HRESULT window_frame(capture_native *s) {
+static HRESULT gdi_frame(capture_native *s) {
     int w = s->rect.w, h = s->rect.h;
-    if (!IsWindow(s->hwnd))
+    if (s->hwnd && !IsWindow(s->hwnd))
         return HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
     if (!s->dc) {
         HDC screen = GetDC(NULL);
@@ -174,9 +185,24 @@ static HRESULT window_frame(capture_native *s) {
         s->bw = w;
         s->bh = h;
     }
-    // PW_CLIENTONLY | PW_RENDERFULLCONTENT: bounds and pixels both cover the client area.
-    if (!PrintWindow(s->hwnd, s->dc, 3))
-        return E_FAIL;
+    if (s->hwnd) {
+        // PW_CLIENTONLY | PW_RENDERFULLCONTENT: capture the client area.
+        if (!PrintWindow(s->hwnd, s->dc, 3))
+            return E_FAIL;
+    } else {
+        // Seed a new duplication even when DWM has no new presentation to report.
+        HDC screen = GetDC(NULL);
+        if (!screen)
+            return E_FAIL;
+        BOOL copied = BitBlt(s->dc, 0, 0, w, h, screen, s->rect.x, s->rect.y,
+                             SRCCOPY | CAPTUREBLT);
+        ReleaseDC(NULL, screen);
+        if (!copied)
+            return E_FAIL;
+        GdiFlush();
+        s->image = (capture_image){s->pixels, w * 4, w, h};
+        return S_OK;
+    }
     GdiFlush();
     size_t size = (size_t)w * h * 4;
     if (size > s->rotated_size) {
@@ -188,8 +214,6 @@ static HRESULT window_frame(capture_native *s) {
         changed = 1;
     }
     // PrintWindow has no update notifications. Compare against the last image.
-    for (size_t i = 3; i < size; i += 4)
-        s->pixels[i] = 255;
     if (!changed)
         changed = memcmp(s->rotated, s->pixels, size) != 0;
     if (changed)
@@ -203,6 +227,8 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
                              const DXGI_OUTDUPL_FRAME_INFO *info) {
     D3D11_TEXTURE2D_DESC d, desc;
     ID3D11Texture2D_GetDesc(texture, &d);
+    if (d.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+        return DXGI_ERROR_UNSUPPORTED;
     desc = d;
     if (box) {
         desc.Width = box->right - box->left;
@@ -335,29 +361,32 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
                 unmap(s);
                 RELEASE(s->staging);
                 s->image = (capture_image){0};
-                hr = window_frame(s);
+                hr = gdi_frame(s);
             }
         } else
-            hr = window_frame(s);
+            hr = gdi_frame(s);
         *image = s->image;
         return hr;
     }
     if (!s->dup) {
         hr = desktop_init(s);
-        *image = s->image;
-        return FAILED(hr) ? hr : S_FALSE;
+        if (FAILED(hr))
+            return hr;
     }
     DXGI_OUTDUPL_FRAME_INFO info;
     IDXGIResource *resource = NULL;
     hr = IDXGIOutputDuplication_AcquireNextFrame(s->dup, timeout_ms, &info, &resource);
     if (hr == DXGI_ERROR_ACCESS_LOST) {
         hr = desktop_init(s);
+        if (SUCCEEDED(hr))
+            hr = gdi_frame(s);
         *image = s->image;
-        return FAILED(hr) ? hr : S_FALSE;
+        return hr;
     }
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        hr = s->image.pixels ? S_FALSE : gdi_frame(s);
         *image = s->image;
-        return S_FALSE;
+        return hr;
     }
     if (FAILED(hr))
         return hr;
@@ -365,8 +394,9 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
     if (!info.LastPresentTime.QuadPart) {
         RELEASE(resource);
         IDXGIOutputDuplication_ReleaseFrame(s->dup);
+        hr = s->image.pixels ? S_FALSE : gdi_frame(s);
         *image = s->image;
-        return S_FALSE;
+        return hr;
     }
     ID3D11Texture2D *texture = NULL;
     hr = IDXGIResource_QueryInterface(resource, &IID_ID3D11Texture2D, (void **)&texture);
