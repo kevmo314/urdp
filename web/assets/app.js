@@ -32,6 +32,8 @@ async function negotiate(pc) {
   pc.addTransceiver('audio', { direction: 'recvonly' });
   input = pc.createDataChannel('input', { ordered: true });
   move = pc.createDataChannel('move', { ordered: false, maxRetransmits: 0 });
+  move.bufferedAmountLowThreshold = 0;
+  move.onbufferedamountlow = flushMove;
   input.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.t === 'ended') toast('Source closed');
@@ -104,26 +106,40 @@ function norm(e) {
   return { x: Math.min(Math.max(x, 0), 1), y: Math.min(Math.max(y, 0), 1) };
 }
 
+// Only the latest position matters for an absolute pointer, so while the
+// channel is backed up, keep just the newest one and send it once it drains.
+let pendingMove;
+function flushMove() {
+  if (pendingMove && move?.bufferedAmount === 0) {
+    send(move, pendingMove);
+    pendingMove = undefined;
+  }
+}
 video.addEventListener('pointermove', (e) => {
-  // Only the latest position matters for an absolute pointer, so skip
-  // this one rather than queue it behind others on a congested link.
-  if (move?.bufferedAmount > 0) return;
-  send(move, { t: 'm', ...norm(e) });
+  pendingMove = { t: 'm', ...norm(e) };
+  flushMove();
 });
 // Capture keeps moves (and the final release) flowing while dragging
 // outside the video.
 video.addEventListener('pointerdown', (e) => video.setPointerCapture(e.pointerId));
 // mousedown/up rather than pointerdown/up: pointer events only fire for
 // the first press and last release, losing chorded buttons.
+// Buttons pressed on the video, so releases elsewhere (e.g. after dragging
+// out) are forwarded but clicks on the HUD are not.
+const held = new Set();
 video.addEventListener('mousedown', (e) => {
   video.focus();
+  held.add(e.button);
   send(input, { t: 'd', b: e.button, ...norm(e) });
   e.preventDefault();
 });
 window.addEventListener('mouseup', (e) => {
-  if (gate.hidden) send(input, { t: 'u', b: e.button, ...norm(e) });
+  if (!held.delete(e.button)) return;
+  send(input, { t: 'u', b: e.button, ...norm(e) });
+  e.preventDefault();
 });
-video.addEventListener('pointercancel', () => send(input, { t: 'reset' }));
+const reset = () => { held.clear(); send(input, { t: 'reset' }); };
+video.addEventListener('pointercancel', reset);
 video.addEventListener('contextmenu', (e) => e.preventDefault());
 video.addEventListener('wheel', (e) => {
   const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1;
@@ -142,7 +158,7 @@ window.addEventListener('keyup', (e) => {
   e.preventDefault();
 });
 // Don't leave modifiers stuck on the host when focus leaves the page.
-window.addEventListener('blur', () => send(input, { t: 'reset' }));
+window.addEventListener('blur', reset);
 
 document.getElementById('fullscreen').onclick = async () => {
   await document.documentElement.requestFullscreen();

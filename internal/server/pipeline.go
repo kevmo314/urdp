@@ -125,8 +125,8 @@ func (p *pipeline) run() {
 	defer timer.Stop()
 	start := time.Now()
 	kbps := p.opts.BitrateKbps
-	var nextRate time.Time
-	var sentBytes int // since nextRate was last set
+	lastRate := start
+	sentBytes := 0 // since lastRate
 
 	// Packetize here rather than via TrackLocalStaticSample so each frame
 	// carries its own capture time as RTP timestamp. (The sample track
@@ -163,8 +163,15 @@ func (p *pipeline) run() {
 			timer.Reset(0)
 			continue
 		}
-		// Space capture starts at least one interval apart.
-		timer.Reset(interval - time.Since(captureStart))
+		// Space frames at least one interval apart, measured from when this
+		// frame was grabbed: the capture start, unless Capture spent a
+		// while waiting for the screen to change (allow a quarter interval
+		// for the grab itself).
+		grabbed := captureStart
+		if g := t0.Add(-interval / 4); g.After(grabbed) {
+			grabbed = g
+		}
+		timer.Reset(interval - time.Since(grabbed))
 		t1 := time.Now()
 
 		if enc != nil {
@@ -174,18 +181,18 @@ func (p *pipeline) run() {
 			}
 		}
 		if enc == nil {
-			if enc, err = encoder.New(f.Width, f.Height, p.opts); err != nil {
+			opts := p.opts
+			opts.BitrateKbps = kbps // keep the congestion-controlled cap
+			if enc, err = encoder.New(f.Width, f.Height, opts); err != nil {
 				log.Printf("source %s: %v", p.id, err)
 				enc = nil
 				continue
 			}
 			p.keyframe.Store(true)
-			kbps = p.opts.BitrateKbps
 		}
-		if t1.After(nextRate) {
-			const window = 250 * time.Millisecond
-			sent := int(float64(sentBytes*8) / window.Seconds())
-			nextRate, sentBytes = t1.Add(window), 0
+		if elapsed := t1.Sub(lastRate); elapsed >= 250*time.Millisecond {
+			sent := int(float64(sentBytes*8) / elapsed.Seconds())
+			lastRate, sentBytes = t1, 0
 			// Only reconfigure on meaningful changes; it isn't free.
 			if k := p.targetKbps(sent); k < kbps*9/10 || k > kbps*11/10 {
 				if err := enc.SetBitrate(k); err == nil {
@@ -207,10 +214,9 @@ func (p *pipeline) run() {
 		ts := tsBase + uint32(t0.Sub(start)*90000/time.Second)
 		for _, pkt := range packetizer.Packetize(data, 0) {
 			pkt.Timestamp = ts
-			if err := p.track.WriteRTP(pkt); err != nil {
-				log.Printf("source %s: write: %v", p.id, err)
-				break
-			}
+			// An error means some viewer failed; keep going so the others
+			// get the whole frame.
+			_ = p.track.WriteRTP(pkt)
 		}
 
 		ew, eh := enc.Size()

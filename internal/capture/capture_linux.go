@@ -129,9 +129,12 @@ static int grabber_locate(grabber *g, XWindowAttributes *a) {
 	return 0;
 }
 
+// Like grabber_locate, but returns 1 if the size no longer matches the
+// last grabbed image (resizes don't always produce damage).
 static int grabber_relocate(grabber *g) {
 	XWindowAttributes a;
-	return grabber_locate(g, &a);
+	if (grabber_locate(g, &a)) return -2;
+	return (a.width & ~1) != g->w || (a.height & ~1) != g->h;
 }
 
 // Returns 0 on success, -1 on failure, -2 if the window is gone/unmapped.
@@ -251,13 +254,18 @@ func (s *x11Source) Capture(wait time.Duration) (*Frame, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if C.grabber_wait(s.g, C.int(wait.Milliseconds())) == 0 && s.frame.Pix != nil {
-		// Unchanged, but the window may have moved or closed.
-		if C.grabber_relocate(s.g) != 0 {
+		// Unchanged, but the window may have moved, resized or closed.
+		switch C.grabber_relocate(s.g) {
+		case -2:
 			return nil, false, ErrNotFound
+		case 0:
+			s.rect = image.Rect(int(s.g.x), int(s.g.y), int(s.g.x)+s.frame.Width, int(s.g.y)+s.frame.Height)
+			return &s.frame, false, nil
 		}
-		s.rect = image.Rect(int(s.g.x), int(s.g.y), int(s.g.x)+s.frame.Width, int(s.g.y)+s.frame.Height)
-		return &s.frame, false, nil
 	}
+	// A failed grab may have freed the image s.frame points into; don't
+	// hand it out again.
+	s.frame = Frame{}
 	switch C.grabber_grab(s.g) {
 	case -2:
 		return nil, false, ErrNotFound

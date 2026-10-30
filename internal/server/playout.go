@@ -29,17 +29,18 @@ func (p *playoutDelay) BindLocalStream(info *interceptor.StreamInfo, w intercept
 			id = e.ID
 		}
 	}
-	if id == 0 {
-		return w
-	}
 	zero := []byte{0, 0, 0}
 	return interceptor.RTPWriterFunc(func(h *rtp.Header, payload []byte, a interceptor.Attributes) (int, error) {
-		// The header is shared by every viewer of a track, and each viewer
-		// may have negotiated a different extension id; modify a copy.
+		// A track's header is shared by all its viewers, and interceptors
+		// further down (e.g. transport-cc) set extensions in place with
+		// per-viewer ids. Give each viewer its own copy. This interceptor is
+		// registered last, so it runs first.
 		hdr := *h
 		hdr.Extensions = slices.Clone(h.Extensions)
-		if err := hdr.SetExtension(uint8(id), zero); err != nil {
-			return 0, err
+		if id != 0 {
+			if err := hdr.SetExtension(uint8(id), zero); err != nil {
+				return 0, err
+			}
 		}
 		return w.Write(&hdr, payload, a)
 	})
