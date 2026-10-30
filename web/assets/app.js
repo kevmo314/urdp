@@ -537,3 +537,32 @@ window.addEventListener('pointermove', (e) => {
   if (!gate.hidden) return;
   hud.hidden = e.clientY > 48 && !hud.matches(':hover') && document.activeElement !== sourcesEl;
 });
+
+// ---- scaling ----
+// "fit" scales the stream to the window; "native" shows host pixels 1:1
+// (per device pixel, so it stays sharp on HiDPI screens) and scrolls.
+
+const scaleBtn = document.getElementById('scale');
+let scaleMode = 'fit';
+try { scaleMode = localStorage.getItem('urdp.scale') || 'fit'; } catch { /* storage unavailable */ }
+
+function applyScale() {
+  const native = scaleMode === 'native';
+  document.documentElement.classList.toggle('native', native);
+  video.style.width = native && video.videoWidth ? `${video.videoWidth / devicePixelRatio}px` : '';
+  video.style.height = native && video.videoHeight ? `${video.videoHeight / devicePixelRatio}px` : '';
+  scaleBtn.textContent = native ? '1:1' : 'Fit';
+  videoRect = video.getBoundingClientRect();
+}
+scaleBtn.onclick = () => {
+  scaleMode = scaleMode === 'fit' ? 'native' : 'fit';
+  try { localStorage.setItem('urdp.scale', scaleMode); } catch { /* storage unavailable */ }
+  applyScale();
+};
+// The stream's size changes when the source resizes; so does the device
+// pixel ratio when the window moves between screens.
+video.addEventListener('resize', applyScale);
+matchMedia(`(resolution: ${devicePixelRatio}dppx)`).addEventListener?.('change', applyScale);
+// Scrolling moves the video without resizing it.
+window.addEventListener('scroll', () => { videoRect = video.getBoundingClientRect(); }, { passive: true });
+applyScale();

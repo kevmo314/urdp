@@ -2,6 +2,10 @@
 [hidden] { display: none !important; }
 html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font: 13px system-ui, sans-serif; color: #ddd; }
 video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; outline: none; cursor: default; }
+/* 1:1 mode: one video pixel per device pixel, scrolling when larger than the window. */
+html.native { overflow: auto; }
+html.native body { overflow: visible; }
+html.native video { position: static; display: block; margin: auto; object-fit: fill; }
 .overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 8px; background: rgba(0, 0, 0, .6); }
 .term { font: 14px/1.5 ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace; background: #0d0d0d; border: 1px solid #333; border-radius: 8px; padding: 16px 20px; min-width: min(560px, 92vw); max-width: 92vw; max-height: 86vh; overflow: auto; box-shadow: 0 10px 40px rgba(0, 0, 0, .6); }
 .prompt { color: #9a9a9a; margin-bottom: 6px; }

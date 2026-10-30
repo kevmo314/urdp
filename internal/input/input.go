@@ -73,8 +73,10 @@ func (d *Dispatcher) Handle(msg []byte) error {
 func (d *Dispatcher) point(x, y float64) (int, int) {
 	r := d.Bounds()
 	clamp := func(v float64) float64 { return min(max(v, 0), 1) }
-	px := r.Min.X + int(clamp(x)*float64(r.Dx()-1)+0.5)
-	py := r.Min.Y + int(clamp(y)*float64(r.Dy()-1)+0.5)
+	// The client sends the pointer's offset within the picture divided by
+	// its size, so pixel i covers [i/W, (i+1)/W).
+	px := r.Min.X + min(int(clamp(x)*float64(r.Dx())), r.Dx()-1)
+	py := r.Min.Y + min(int(clamp(y)*float64(r.Dy())), r.Dy()-1)
 	return px, py
 }
 
