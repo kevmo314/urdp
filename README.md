@@ -18,6 +18,25 @@ URDP_PASSWORD=hunter2 ./urdp -hosts desk.example.com   # require a password; all
 - In the stream, the 🎤 and 📷 buttons share your microphone and camera with the host. Connected gamepads are forwarded automatically.
 - Add `?probe` when viewing the same machine's desktop to measure capture→display latency in the browser (see below).
 
+## AI agents (MCP)
+
+urdp serves an [MCP](https://modelcontextprotocol.io) endpoint at `/mcp`, so an agent can see and drive the host. Turn it off with `-mcp=false`.
+
+```
+claude mcp add --transport http urdp http://host:8000/mcp
+# with -password set:
+claude mcp add --transport http urdp http://host:8000/mcp --header "Authorization: Basic $(printf x:PASSWORD | base64)"
+```
+
+| Tool | What it does |
+|---|---|
+| `list_sources` | monitors and windows (ids, titles, apps, sizes) |
+| `screenshot` | the desktop, one monitor (`display1`) or a window (`0x…`); PNG or JPEG, downscaled to 1280px wide by default |
+| `click`, `move`, `drag`, `scroll` | pointer actions at `(x, y)` in the most recent screenshot's pixels for that source |
+| `type_text` | types ASCII text (US layout) |
+| `key` | a key or combination: `Enter`, `ctrl+c`, `alt+F4`, `cmd+space` |
+| `focus_window` | raises and focuses a window |
+
 ## How it works
 
 | Stage | Linux (X11) | Windows | macOS |

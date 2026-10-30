@@ -38,6 +38,7 @@ func main() {
 		hosts     = flag.String("hosts", "", "comma-separated hostnames clients may use to reach the server (IPs and localhost are always allowed)")
 		codecs    = flag.String("codecs", "h264,h265,av1,vp9,vp8", "video codec preference; viewers can also ask for one with ?codec=")
 		backend   = flag.String("encoder", "", `encoder backend: "" for automatic (hardware first), "hardware", "software", or a name such as "x264"`)
+		mcpOn     = flag.Bool("mcp", true, "serve an MCP endpoint at /mcp so AI agents can take screenshots and drive input")
 		list      = flag.Bool("list", false, "list capturable windows and exit")
 		password  = flag.String("password", os.Getenv("URDP_PASSWORD"), "require this password (HTTP basic auth, any username); defaults to $URDP_PASSWORD")
 		usb       = flag.Bool("usb", false, "experimental: let viewers attach their USB devices (WebUSB) to this host via USB/IP")
@@ -60,9 +61,10 @@ func main() {
 		log.Fatal(err)
 	}
 	cfg := server.Config{
-		WebFS:     web,
-		Encoder:   encoder.Options{FPS: *fps, BitrateKbps: *bitrate, KeyintSeconds: *keyint, Backend: *backend},
-		AudioKbps: *audioKbps,
+		WebFS:      web,
+		Encoder:    encoder.Options{FPS: *fps, BitrateKbps: *bitrate, KeyintSeconds: *keyint, Backend: *backend},
+		AudioKbps:  *audioKbps,
+		DisableMCP: !*mcpOn,
 	}
 	if *stun != "" {
 		cfg.ICEServers = []webrtc.ICEServer{{URLs: strings.Split(*stun, ",")}}

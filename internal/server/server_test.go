@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/fstest"
 	"time"
 
 	"github.com/pion/rtp/codecs"
@@ -481,5 +482,20 @@ func TestChooseCodec(t *testing.T) {
 	// offer) fall back to the preference order.
 	if c := s.chooseCodec(offer, "vp9"); c != encoder.H264 {
 		t.Errorf("unavailable request = %s, want H264", c)
+	}
+}
+
+// The full route set (web UI included) must register without conflicts.
+func TestRoutesWithWebUI(t *testing.T) {
+	_, ts := newTestServer(t, &fakeInjector{}, func(c *Config) {
+		c.WebFS = fstest.MapFS{"index.html": {Data: []byte("<!doctype html>")}}
+	})
+	res, err := http.Get(ts.URL + "/0x1234")
+	if err != nil || res.StatusCode != 200 {
+		t.Fatalf("index for a window path: %v %v", err, res.Status)
+	}
+	res, err = http.Post(ts.URL+"/mcp", "application/json", strings.NewReader("{}"))
+	if err != nil || res.StatusCode == 404 {
+		t.Fatalf("mcp endpoint missing: %v %v", err, res.Status)
 	}
 }

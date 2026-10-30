@@ -27,6 +27,7 @@ import (
 	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/webrtc/v4"
 
+	"github.com/kevmo314/urdp/internal/agent"
 	"github.com/kevmo314/urdp/internal/audio"
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
@@ -45,6 +46,8 @@ type Config struct {
 	AudioKbps int
 	// ICEServers are passed to the peer connection (e.g. STUN for NAT).
 	ICEServers []webrtc.ICEServer
+	// DisableMCP turns off the /mcp endpoint for AI agents.
+	DisableMCP bool
 	// AllowedHosts are hostnames (besides IPs and localhost) the server may
 	// be reached by, e.g. "desktop.example.com". See allowedRequest.
 	AllowedHosts []string
@@ -126,6 +129,18 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), pipelines: map[string]*pipeline{}}
 
+	if !cfg.DisableMCP {
+		h := agent.Handler(agent.Deps{
+			OpenSource:   cfg.OpenSource,
+			ListWindows:  cfg.ListWindows,
+			ListDisplays: cfg.ListDisplays,
+			Injector:     s.injector,
+		})
+		// Per method, so the patterns don't conflict with "GET /".
+		for _, m := range []string{"GET", "POST", "DELETE"} {
+			s.mux.Handle(m+" /mcp", h)
+		}
+	}
 	s.mux.HandleFunc("GET /api/info", s.handleInfo)
 	s.mux.HandleFunc("GET /api/displays", s.handleDisplays)
 	s.mux.HandleFunc("GET /api/windows", s.handleWindows)
