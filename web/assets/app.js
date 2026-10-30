@@ -450,9 +450,9 @@ if (probe) {
   c.height = CELL;
   c.style.cssText = `position:fixed;left:0;top:0;width:${c.width}px;height:${c.height}px;z-index:9;image-rendering:pixelated`;
   document.body.append(c);
-  // desynchronized lets the canvas reach the screen without waiting on the
-  // page compositor, so the painted timestamp is fresher.
-  const ctx = c.getContext('2d', { alpha: false, desynchronized: true });
+  // Not desynchronized: without a GPU that canvas bypasses what screen
+  // capture sees, and the probe would read stale timestamps.
+  const ctx = c.getContext('2d', { alpha: false });
   const paint = () => {
     const t = Math.round(performance.now()) & 0xfff;
     for (let i = 0; i < BITS; i++) {
