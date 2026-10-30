@@ -383,6 +383,11 @@ async function loadTree() {
   treeEl.replaceChildren(...rows);
 }
 
+// ---- USB passthrough (experimental; the server needs -usb) ----
+
+import { setupUSB } from './usb.js';
+setupUSB(hud, () => pc, toast);
+
 // ---- start ----
 
 let started = false;

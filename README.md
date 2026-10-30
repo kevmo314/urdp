@@ -96,6 +96,23 @@ Anyone who can reach the port can see your screen and control your mouse and key
 - The API rejects cross-site requests and any `Host` header that isn't an IP, `localhost`, or a name passed in `-hosts`. This stops other websites from driving it through your browser (CSRF and DNS rebinding).
 - A `/<window-id>` stream limits what is *shown*, not what can be *done*. Keyboard input and shortcuts still reach the whole desktop.
 
+## USB passthrough (experimental)
+
+With `-usb`, the viewer can plug a USB device from their own computer into the host. Click **USB** in the HUD, then pick a device. The host then sees it as a real USB device, so its normal drivers bind and `lsusb` lists it. The flag is off by default, because it lets anyone who can view the host attach arbitrary USB devices to it.
+
+- **Browser:** WebUSB opens the device and claims its interfaces. Each device gets its own reliable `usb` data channel. The server translates every URB into one WebUSB call (`controlTransferIn/Out`, `transferIn/Out`, `isochronousTransferIn/Out`, `selectConfiguration`, `selectAlternateInterface`, `clearHalt` or `reset`). See `internal/usbip/wire.go` for the protocol.
+- **Linux host:** the server speaks USB/IP to the kernel's `vhci-hcd` directly. It gives the kernel one end of a socket pair through `/sys/devices/platform/vhci_hcd.0/attach`, which is what `usbip attach` does. Run `sudo modprobe vhci-hcd` first. Writing that file needs root, or group write access (`chgrp`/`chmod g+w` on `attach` and `detach`).
+- **Windows host:** install [usbip-win2](https://github.com/vadimgrn/usbip-win2) and put `usbip.exe` on PATH. The server runs a one-device USB/IP server on 127.0.0.1 and runs `usbip.exe attach` against it. This path is untested on Windows.
+- The device is detached when the viewer unplugs it, the channel closes or the viewer disconnects.
+
+Limits:
+
+- WebUSB needs Chrome or Edge on a secure origin (HTTPS or localhost).
+- The browser refuses to claim the protected interface classes, which are HID, mass storage, audio, video, audio/video, smart card and wireless controller, and it blocklists security keys. So in practice this works for vendor-specific and CDC devices.
+- The viewer's OS must not have a driver bound to the device. Desktop Linux needs udev read/write access and no kernel driver on the interface. Windows needs the WinUSB driver.
+- Isochronous transfers are forwarded, but Chrome doesn't support them on Windows.
+- WebUSB can't cancel a transfer. The host's cancelled reads are answered at once. Data that a cancelled read later receives goes to the next read on that endpoint.
+
 ## Layout
 
 ```
@@ -105,5 +122,6 @@ internal/encoder         libx264 wrapper and BGRA→I420
 internal/audio           loopback capture (PulseAudio / WASAPI) and Opus
 internal/input           wire protocol, keymap, XTest / SendInput injectors
 internal/server          HTTP + signaling, shared pipelines, playout-delay interceptor
+internal/usbip           USB passthrough: USB/IP codec, vhci-hcd / usbip-win2 attach, WebUSB bridge
 web/                     browser client
 ```

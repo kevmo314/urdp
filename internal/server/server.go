@@ -31,6 +31,7 @@ import (
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
 	"github.com/kevmo314/urdp/internal/input"
+	"github.com/kevmo314/urdp/internal/usbip"
 	"github.com/kevmo314/urdp/internal/vdev"
 )
 
@@ -47,6 +48,9 @@ type Config struct {
 	// NAT1To1IPs advertises these IPs as host candidates, for hosts
 	// behind 1:1 NAT (e.g. WSL2, containers).
 	NAT1To1IPs []string
+	// USB attaches viewers' WebUSB devices to this host (-usb); nil
+	// disables USB passthrough.
+	USB usbip.Attacher
 
 	// Hooks for tests and alternative platforms; nil means the defaults.
 	OpenSource   func(id string) (capture.Source, error)
@@ -429,7 +433,7 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 		s.release(p)
 		return nil, err
 	}
-	sess := &session{p: p, pc: pc}
+	sess := &session{p: p, pc: pc, usb: s.cfg.USB}
 	closed := make(chan struct{})
 	var closeOnce sync.Once
 	cleanup := func() {
@@ -483,6 +487,7 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 			p.keyframe.Store(true)
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			sess.release()
+			sess.closeUSB()
 			cleanup()
 		}
 	})
