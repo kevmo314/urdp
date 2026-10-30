@@ -74,6 +74,19 @@ func TestWindowCapture(t *testing.T) {
 	if src.WindowID() != win.ID || src.Bounds().Min.X < 0 {
 		t.Errorf("window id %x bounds %v", src.WindowID(), src.Bounds())
 	}
+	// Nothing draws to an idle xterm, so damage tracking should report no
+	// change and the wait should honor its timeout.
+	start := time.Now()
+	if _, changed, err := src.Capture(100 * time.Millisecond); err != nil || changed {
+		t.Errorf("idle capture: changed=%v err=%v", changed, err)
+	}
+	if d := time.Since(start); d < 80*time.Millisecond {
+		t.Errorf("idle capture returned after %v, want ~100ms", d)
+	}
+	exec.Command("xdotool", "windowsize", FormatID(win.ID), "500", "300").Run()
+	if _, changed, err := src.Capture(time.Second); err != nil || !changed {
+		t.Errorf("capture after resize: changed=%v err=%v", changed, err)
+	}
 
 	cmd.Process.Kill()
 	cmd.Wait()

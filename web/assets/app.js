@@ -171,6 +171,7 @@ async function updateStats() {
     lines.push(`rtt ${rtt.toFixed(0)}ms  jitbuf ${jb.toFixed(0)}ms  dec ${dec.toFixed(1)}ms  lost ${v.packetsLost}`);
   }
   prev = v;
+  if (probe) lines.push(probeStats());
   statsEl.textContent = lines.join('\n');
 }
 
@@ -186,3 +187,61 @@ document.getElementById('start').onclick = async () => {
   setInterval(updateStats, 1000);
   try { await connect(); } catch (e) { toast(`Error: ${e.message}`); setTimeout(reconnect, 2000); }
 };
+
+// ---- latency probe ----
+// With ?probe, while viewing this machine's own desktop, the page paints a
+// 12-bit millisecond timestamp as black/white blocks, finds those blocks in
+// the received video and reports how old the decoded picture is: the
+// capture → encode → network → decode latency, excluding display scan-out.
+
+const probe = new URLSearchParams(location.search).has('probe');
+const BITS = 12, CELL = 12; // CSS px per block
+let probeLatency = [];
+
+if (probe) {
+  const c = document.createElement('canvas');
+  c.width = BITS * CELL;
+  c.height = CELL;
+  c.style.cssText = `position:fixed;left:0;top:0;width:${c.width}px;height:${c.height}px;z-index:9;image-rendering:pixelated`;
+  document.body.append(c);
+  const ctx = c.getContext('2d');
+  const paint = () => {
+    const t = Math.round(performance.now()) & 0xfff;
+    for (let i = 0; i < BITS; i++) {
+      ctx.fillStyle = (t >> (BITS - 1 - i)) & 1 ? '#fff' : '#000';
+      ctx.fillRect(i * CELL, 0, CELL, CELL);
+    }
+    requestAnimationFrame(paint);
+  };
+  paint();
+
+  const sample = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+  const read = () => {
+    video.requestVideoFrameCallback(read);
+    // Where the probe sits on the physical screen, in video pixels.
+    const dpr = devicePixelRatio;
+    const x0 = (screenX + (outerWidth - innerWidth) / 2) * dpr;
+    const y0 = (screenY + outerHeight - innerHeight) * dpr;
+    const cell = CELL * dpr;
+    sample.canvas.width = BITS;
+    sample.canvas.height = 1;
+    // Sample the center of each block.
+    for (let i = 0; i < BITS; i++) {
+      sample.drawImage(video, x0 + (i + 0.5) * cell - 1, y0 + cell / 2 - 1, 2, 2, i, 0, 1, 1);
+    }
+    const px = sample.getImageData(0, 0, BITS, 1).data;
+    let t = 0;
+    for (let i = 0; i < BITS; i++) t = (t << 1) | (px[i * 4 + 1] > 128 ? 1 : 0);
+    const lat = ((Math.round(performance.now()) & 0xfff) - t + 0x1000) & 0xfff;
+    if (lat < 1000) probeLatency.push(lat);
+  };
+  video.requestVideoFrameCallback(read);
+}
+
+function probeStats() {
+  if (!probeLatency.length) return '';
+  const s = probeLatency.sort((a, b) => a - b);
+  const p = (q) => s[Math.min(s.length - 1, Math.floor(q * s.length))];
+  probeLatency = [];
+  return `e2e p50 ${p(0.5)}ms  p90 ${p(0.9)}ms`;
+}

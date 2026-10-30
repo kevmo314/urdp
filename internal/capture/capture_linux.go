@@ -1,12 +1,15 @@
 package capture
 
 /*
-#cgo pkg-config: x11 xext xcomposite
+#cgo pkg-config: x11 xext xcomposite xdamage
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xcomposite.h>
+#include <X11/extensions/Xdamage.h>
+#include <poll.h>
+#include <time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <stdlib.h>
@@ -28,6 +31,8 @@ typedef struct {
 	XImage *img;
 	int w, h;   // current image size
 	int x, y;   // position of target in root coordinates
+	Damage damage;
+	int damage_event;
 } grabber;
 
 static void grabber_free_image(grabber *g) {
@@ -70,29 +75,76 @@ static grabber *grabber_open(unsigned long win) {
 		if (XCompositeQueryExtension(dpy, &ev, &er))
 			XCompositeRedirectWindow(dpy, win, CompositeRedirectAutomatic);
 	}
+	int ev, er;
+	if (XDamageQueryExtension(dpy, &ev, &er)) {
+		g->damage_event = ev + XDamageNotify;
+		g->damage = XDamageCreate(dpy, g->target, XDamageReportNonEmpty);
+	}
 	return g;
+}
+
+static long now_ms(void) {
+	struct timespec t;
+	clock_gettime(CLOCK_MONOTONIC, &t);
+	return t.tv_sec * 1000 + t.tv_nsec / 1000000;
+}
+
+// Waits up to timeout_ms for the target to be drawn to. Returns 1 if it
+// changed (or change tracking is unavailable), 0 on timeout.
+static int grabber_wait(grabber *g, int timeout_ms) {
+	if (!g->damage) return 1;
+	long deadline = now_ms() + timeout_ms;
+	int damaged = 0;
+	for (;;) {
+		while (XPending(g->dpy)) {
+			XEvent e;
+			XNextEvent(g->dpy, &e);
+			if (e.type == g->damage_event) damaged = 1;
+		}
+		long left = deadline - now_ms();
+		if (damaged || left <= 0) break;
+		struct pollfd p = { ConnectionNumber(g->dpy), POLLIN, 0 };
+		if (poll(&p, 1, (int)left) <= 0) break;
+	}
+	// Clear before grabbing, so drawing that lands mid-grab re-arms the
+	// notification instead of being lost.
+	if (damaged) XDamageSubtract(g->dpy, g->damage, None, None);
+	return damaged;
 }
 
 static void grabber_close(grabber *g) {
 	grabber_free_image(g);
+	if (g->damage) XDamageDestroy(g->dpy, g->damage);
 	if (g->win) XCompositeUnredirectWindow(g->dpy, g->win, CompositeRedirectAutomatic);
 	XCloseDisplay(g->dpy);
 	free(g);
 }
 
-// Returns 0 on success, -1 on failure, -2 if the window is gone/unmapped.
-static int grabber_grab(grabber *g) {
-	XWindowAttributes a;
-	if (!XGetWindowAttributes(g->dpy, g->target, &a)) return -2;
-	if (g->win && a.map_state != IsViewable) return -2;
-	int w = a.width & ~1, h = a.height & ~1;
-	if (w <= 0 || h <= 0) return -2;
+// Refreshes the target's geometry. Returns 0, or -2 if the window is
+// gone/unmapped.
+static int grabber_locate(grabber *g, XWindowAttributes *a) {
+	if (!XGetWindowAttributes(g->dpy, g->target, a)) return -2;
+	if (g->win && a->map_state != IsViewable) return -2;
+	if ((a->width & ~1) <= 0 || (a->height & ~1) <= 0) return -2;
 	if (g->win) {
 		Window child;
 		XTranslateCoordinates(g->dpy, g->win, DefaultRootWindow(g->dpy), 0, 0, &g->x, &g->y, &child);
 	} else {
 		g->x = g->y = 0;
 	}
+	return 0;
+}
+
+static int grabber_relocate(grabber *g) {
+	XWindowAttributes a;
+	return grabber_locate(g, &a);
+}
+
+// Returns 0 on success, -1 on failure, -2 if the window is gone/unmapped.
+static int grabber_grab(grabber *g) {
+	XWindowAttributes a;
+	if (grabber_locate(g, &a)) return -2;
+	int w = a.width & ~1, h = a.height & ~1;
 	if (!g->img || w != g->w || h != g->h) {
 		if (grabber_alloc_image(g, a.visual, a.depth, w, h)) return -1;
 	}
@@ -198,9 +250,17 @@ func openX11(win uint64) (Source, error) {
 func openDesktop() (Source, error)         { return openX11(0) }
 func openWindow(id uint64) (Source, error) { return openX11(id) }
 
-func (s *x11Source) Capture(time.Duration) (*Frame, bool, error) {
+func (s *x11Source) Capture(wait time.Duration) (*Frame, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if C.grabber_wait(s.g, C.int(wait.Milliseconds())) == 0 && s.frame.Pix != nil {
+		// Unchanged, but the window may have moved or closed.
+		if C.grabber_relocate(s.g) != 0 {
+			return nil, false, ErrNotFound
+		}
+		s.rect = image.Rect(int(s.g.x), int(s.g.y), int(s.g.x)+s.frame.Width, int(s.g.y)+s.frame.Height)
+		return &s.frame, false, nil
+	}
 	switch C.grabber_grab(s.g) {
 	case -2:
 		return nil, false, ErrNotFound
