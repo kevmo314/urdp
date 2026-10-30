@@ -4,3 +4,4 @@ bin/
 .claude/
 /internal/vdev/macdriver/build/*
 !/internal/vdev/macdriver/build/.keep
+internal/vdev/mfcam/*.dll*

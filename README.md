@@ -49,7 +49,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Cursor shape | XFixes events | GetCursorInfo at 60 Hz | NSCursor.currentSystemCursor at 60 Hz |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
 | Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | built-in CoreAudio driver |
-| Viewer camera | PipeWire camera node (v4l2loopback fallback) | OBS Virtual Camera | — |
+| Viewer camera | PipeWire camera node (v4l2loopback fallback) | urdp Camera (Windows 11, opt-in install; OBS Virtual Camera fallback) | — |
 | Viewer gamepad | uinput (Xbox 360) | ViGEmBus (Xbox 360) | — |
 | USB passthrough | vhci-hcd | usbip-win2 (untested) | — |
 
@@ -116,17 +116,19 @@ The viewer's microphone, webcam and gamepads can appear on the host as virtual d
 
 ### Windows
 
-Cross-compile from Linux or WSL with mingw-w64. The result is a single static `urdp.exe` with no DLLs:
+Cross-compile from Linux or WSL with mingw-w64. The result is a single `urdp.exe` with statically linked codecs and an embedded camera DLL:
 
 ```
-sudo apt install gcc-mingw-w64-x86-64 nasm
-make windows    # builds static x264 + Opus into third_party/, then bin/urdp.exe
+sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm pkg-config
+make windows    # builds codecs and camera source, then bin/urdp.exe
 ```
 
-Viewer devices on Windows need drivers that can't be bundled:
+Viewer devices on Windows:
 
 - **Microphone.** Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/). urdp plays into "CABLE Input", and apps pick "CABLE Output" as their microphone. Set `URDP_MIC_DEVICE` to use a different render endpoint.
-- **Camera.** Install OBS Studio and register its virtual camera once as Administrator, using `data\obs-plugins\win-dshow\virtualcam-install.bat` in the OBS folder. urdp feeds frames into "OBS Virtual Camera", and OBS doesn't need to be running.
+- **Camera (Windows 11, build 22000+).** Run `urdp.exe -install-camera` once from an Administrator terminal. This installs the embedded media source in `%ProgramData%\urdp\urdpcam.dll` and registers it for the Windows Frame Server. Start urdp normally, enable the viewer's 📷 button, then select **urdp Camera** in the host app. No OBS or other software is required. The camera exists while the viewer camera session is open. Run `urdp.exe -uninstall-camera` as Administrator to remove the installation; close camera sessions and consumers first. Windows may retain a loaded DLL; its retired copy is then deleted at the next reboot. Reboot after upgrading an in-use source to ensure Frame Server loads the updated DLL. An already installed OBS Virtual Camera remains a fallback when the native source is not registered.
+
+  The native source accepts incoming I420 frames up to 4096×2160, converts them to NV12 in a shared ring, and scales to the app's selected 1280×720, 640×480, or 1920×1080 format at 30 fps. If the viewer pauses, apps keep receiving the last frame (black before the first frame).
 - **Gamepad.** Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases). Each pad appears as an Xbox 360 controller.
 
 When running `urdp.exe` from WSL, Windows may ask whether to allow it through the firewall. Access from the same machine over loopback works either way. Allow it if you want other machines to connect.

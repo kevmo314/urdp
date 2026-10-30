@@ -1,7 +1,7 @@
 package vdev
 
 /*
-#cgo windows LDFLAGS: -lole32 -lsetupapi -ladvapi32
+#cgo windows LDFLAGS: -lole32 -lsetupapi -ladvapi32 -lmfplat -lmfuuid -static -lstdc++ -static-libgcc -static-libstdc++
 #include <stdlib.h>
 #include "native_windows.h"
 */
@@ -120,17 +120,17 @@ func openCamera() (Camera, error) {
 	var native *C.camera_native
 	if code := C.camera_open(&native); code != 0 {
 		if code == 183 {
-			return nil, errors.New("virtual camera: OBS queue is already in use; stop OBS Virtual Camera and close its consumers before retrying")
+			return nil, errors.New("virtual camera is already in use; close the other urdp camera session or stop OBS Virtual Camera before retrying")
 		}
 		if code == 2 || code == 3 {
-			return nil, fmt.Errorf("%w: install/register OBS Studio Virtual Camera (https://obsproject.com/); if OBS is installed, run data/obs-plugins/win-dshow/virtualcam-install.bat as Administrator, and leave OBS Virtual Camera stopped", ErrUnsupported)
+			return nil, fmt.Errorf("%w: run `urdp.exe -install-camera` once as Administrator", ErrUnsupported)
 		}
-		return nil, fmt.Errorf("virtual camera: open OBS queue (Windows error %d)", uint32(code))
+		return nil, fmt.Errorf("virtual camera: open (Windows error/HRESULT 0x%08x)", uint32(code))
 	}
 	return &windowsCamera{native: native}, nil
 }
 func validateImage(img *Image) error {
-	if img == nil || img.Width <= 0 || img.Height <= 0 || img.Width > 16384 || img.Height > 16384 {
+	if img == nil || img.Width <= 0 || img.Height <= 0 || img.Width > 4096 || img.Height > 2160 {
 		return errors.New("virtual camera: invalid image dimensions")
 	}
 	cw, ch := (img.Width+1)/2, (img.Height+1)/2

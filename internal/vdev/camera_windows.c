@@ -5,12 +5,6 @@
 #include <stdlib.h>
 #include <string.h>
 
-// MFCreateVirtualCamera needs a separate registered COM media source. Microsoft's
-// sample installs that DLL in HKLM, and FrameServer/FrameServerMonitor load it in
-// service processes; extracting a DLL and registering it in the caller's HKCU
-// does not supply service-visible registration. Use the already installed OBS
-// source instead, keeping URDP a single executable without an admin installer.
-// https://github.com/microsoft/Windows-Camera/tree/master/Samples/VirtualCamera
 // OBS wire layout:
 // https://github.com/obsproject/obs-studio/blob/master/shared/obs-shared-memory-queue/shared-memory-queue.c
 // Fixed output keeps the mapping valid while a consumer holds it open. Scale
@@ -26,12 +20,12 @@ struct queue_header {
     uint32_t reserved[8];
 };
 _Static_assert(sizeof(struct queue_header) == 80, "OBS queue ABI");
-struct camera_native {
+struct obs_camera_native {
     HANDLE mapping;
     struct queue_header *header;
     LARGE_INTEGER frequency;
 };
-void camera_close(camera_native *s) {
+void obs_camera_close(obs_camera_native *s) {
     if (!s)
         return;
     if (s->header) {
@@ -42,7 +36,7 @@ void camera_close(camera_native *s) {
         CloseHandle(s->mapping);
     free(s);
 }
-unsigned long camera_open(camera_native **out) {
+unsigned long obs_camera_open(obs_camera_native **out) {
     HKEY key;
     // The standard OBS Studio DirectShow virtual camera COM registration.
     LONG status = RegOpenKeyExW(HKEY_CLASSES_ROOT,
@@ -51,7 +45,7 @@ unsigned long camera_open(camera_native **out) {
     if (status != ERROR_SUCCESS)
         return status;
     RegCloseKey(key);
-    camera_native *s = calloc(1, sizeof(*s));
+    obs_camera_native *s = calloc(1, sizeof(*s));
     if (!s)
         return ERROR_OUTOFMEMORY;
     const DWORD frame_bytes = CAM_WIDTH * CAM_HEIGHT * 3 / 2;
@@ -61,13 +55,13 @@ unsigned long camera_open(camera_native **out) {
                                     header_bytes + 3 * slot_bytes, L"OBSVirtualCamVideo");
     DWORD err = GetLastError();
     if (!s->mapping || err == ERROR_ALREADY_EXISTS) {
-        camera_close(s);
+        obs_camera_close(s);
         return err;
     }
     s->header = MapViewOfFile(s->mapping, FILE_MAP_ALL_ACCESS, 0, 0, 0);
     if (!s->header) {
         err = GetLastError();
-        camera_close(s);
+        obs_camera_close(s);
         return err;
     }
     QueryPerformanceFrequency(&s->frequency);
@@ -81,7 +75,7 @@ unsigned long camera_open(camera_native **out) {
     *out = s;
     return ERROR_SUCCESS;
 }
-void camera_write(camera_native *s, const uint8_t *y, const uint8_t *u, const uint8_t *v, int width,
+void obs_camera_write(obs_camera_native *s, const uint8_t *y, const uint8_t *u, const uint8_t *v, int width,
                   int height, int ys, int us, int vs) {
     struct queue_header *h = s->header;
     uint32_t inc = (uint32_t)h->write_idx + 1;

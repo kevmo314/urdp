@@ -8,6 +8,7 @@ all: linux
 linux:
 	go build -o bin/urdp .
 
+# Also compiles the static-runtime MF source DLL before go:embed is evaluated.
 windows-deps:
 	scripts/build-windows-deps.sh
 

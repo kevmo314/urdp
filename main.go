@@ -43,6 +43,9 @@ func main() {
 		usb       = flag.Bool("usb", false, "experimental: let viewers attach their USB devices (WebUSB) to this host via USB/IP")
 	)
 	flag.Parse()
+	if platformCommand() {
+		return
+	}
 
 	if *list {
 		wins, err := capture.List()

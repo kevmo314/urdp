@@ -14,3 +14,9 @@ unsigned long pad_open(pad_native **out);
 unsigned long pad_update(pad_native *s, uint16_t buttons, uint8_t lt, uint8_t rt, int16_t lx,
                          int16_t ly, int16_t rx, int16_t ry);
 unsigned long pad_close(pad_native *s);
+
+typedef struct obs_camera_native obs_camera_native;
+unsigned long obs_camera_open(obs_camera_native **out);
+void obs_camera_write(obs_camera_native *s, const uint8_t *y, const uint8_t *u, const uint8_t *v, int width,
+                      int height, int ys, int us, int vs);
+void obs_camera_close(obs_camera_native *s);
