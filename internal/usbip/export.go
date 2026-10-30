@@ -1,7 +1,6 @@
 package usbip
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -107,13 +106,42 @@ func (c Command) Attach(dev *Device) (Attachment, error) {
 	if len(c.AttachArgs) == 0 {
 		return nil, errors.New("usbip: no attach command")
 	}
+	return attachLocal(dev, c.Timeout, func(ctx context.Context, port, busid string) (string, error) {
+		args := expand(c.AttachArgs, map[string]string{"port": port, "busid": busid})
+		out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput()
+		if err != nil {
+			return "", fmt.Errorf("%s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
+		}
+		if m := vportRe.FindStringSubmatch(strings.TrimSpace(string(out))); m != nil {
+			return m[1] + m[2], nil
+		}
+		return "", nil
+	}, func(ctx context.Context, port string) error {
+		if len(c.DetachArgs) == 0 {
+			return nil
+		}
+		args := expand(c.DetachArgs, map[string]string{"vport": port})
+		if out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput(); err != nil {
+			return fmt.Errorf("%s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
+		}
+		return nil
+	})
+}
+
+// attachLocal shares the one-device USB/IP server between native driver IOCTLs
+// and command-line clients. attach returns the virtual port used for detach.
+func attachLocal(dev *Device, timeout time.Duration,
+	attach func(context.Context, string, string) (string, error),
+	detach func(context.Context, string) error) (Attachment, error) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		return nil, err
 	}
 	defer ln.Close()
 	info := dev.Info()
-	imported := make(chan net.Conn, 1)
+	imported := make(chan net.Conn)
+	done := make(chan struct{})
+	defer close(done)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -124,7 +152,7 @@ func (c Command) Attach(dev *Device) (Attachment, error) {
 				if ok, _ := ServeImport(conn, info); ok {
 					select {
 					case imported <- conn:
-					default:
+					case <-done:
 						conn.Close() // only one import per device
 					}
 				}
@@ -132,43 +160,41 @@ func (c Command) Attach(dev *Device) (Attachment, error) {
 		}
 	}()
 
-	timeout := c.Timeout
 	if timeout == 0 {
 		timeout = 20 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 	port := fmt.Sprint(ln.Addr().(*net.TCPAddr).Port)
-	args := expand(c.AttachArgs, map[string]string{"port": port, "busid": dev.BusID})
-	cmd := exec.CommandContext(ctx, args[0], args[1:]...)
-	var out bytes.Buffer
-	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Run(); err != nil {
+	vport, err := attach(ctx, port, dev.BusID)
+	if err != nil {
 		select {
 		case conn := <-imported:
 			conn.Close()
 		default:
 		}
-		return nil, fmt.Errorf("%s: %v: %s", args[0], err, strings.TrimSpace(out.String()))
+		return nil, err
 	}
 	select {
 	case conn := <-imported:
-		a := &cmdAttachment{Conn: conn, c: c}
-		if m := vportRe.FindStringSubmatch(strings.TrimSpace(out.String())); m != nil {
-			a.vport = m[1] + m[2]
-		}
+		a := &cmdAttachment{Conn: conn, detach: detach, vport: vport}
 		return a, nil
 	case <-time.After(5 * time.Second):
-		return nil, fmt.Errorf("%s succeeded but never imported the device: %s", args[0], strings.TrimSpace(out.String()))
+		if vport != "" && detach != nil {
+			cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = detach(cleanup, vport)
+		}
+		return nil, errors.New("usbip client succeeded but never imported the device")
 	}
 }
 
 type cmdAttachment struct {
 	net.Conn
-	c     Command
-	vport string
-	once  sync.Once
-	err   error
+	detach func(context.Context, string) error
+	vport  string
+	once   sync.Once
+	err    error
 }
 
 func (a *cmdAttachment) String() string {
@@ -180,12 +206,9 @@ func (a *cmdAttachment) String() string {
 
 func (a *cmdAttachment) Close() error {
 	a.once.Do(func() {
-		if len(a.c.DetachArgs) > 0 && a.vport != "" {
-			args := expand(a.c.DetachArgs, map[string]string{"vport": a.vport})
+		if a.detach != nil && a.vport != "" {
 			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-			if out, err := exec.CommandContext(ctx, args[0], args[1:]...).CombinedOutput(); err != nil {
-				a.err = fmt.Errorf("%s: %v: %s", args[0], err, strings.TrimSpace(string(out)))
-			}
+			a.err = a.detach(ctx, a.vport)
 			cancel()
 		}
 		if err := a.Conn.Close(); a.err == nil {

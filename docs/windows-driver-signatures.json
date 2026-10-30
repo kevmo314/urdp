@@ -1,0 +1,68 @@
+[
+    {
+        "File":  "usbip-0.9.8.1/LICENSE.txt",
+        "SHA256":  "723572b1487231edcc3a2594da30961c693da7a0d7b676ca718fe3391920b8ca",
+        "Status":  null,
+        "Signer":  null
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_filter.cat",
+        "SHA256":  "f259d60bdb5ad9d7a976418bfc9156b788dfcec9b67c8d05d036eb03fb18ffe1",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_filter.inf",
+        "SHA256":  "b7fe01b04793d2f83cf3407601f2c835f1a10c2618e32a52c8fdef1da6b79bff",
+        "Status":  null,
+        "Signer":  null
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_filter.sys",
+        "SHA256":  "b93a5fc3c23d56f9b49634742374e32f269e53f764caa2d5fcb43e3259f7eced",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_ude.cat",
+        "SHA256":  "84dd6cc5985857adf1514a9ee202210ff3ee1384c9be40fd49d6810e23e25f3a",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_ude.inf",
+        "SHA256":  "1ae9e8dc497929de1a6be1291ae1dca6a19e7fd6c0351e8c266f65dd91f15073",
+        "Status":  null,
+        "Signer":  null
+    },
+    {
+        "File":  "usbip-0.9.8.1/usbip2_ude.sys",
+        "SHA256":  "abd4fc43dce40e027e4acc884cbfe92433e026206f6565c5ee5284a39441169a",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    },
+    {
+        "File":  "vigem/LICENSE",
+        "SHA256":  "3959f6ca50466675190590dfd024585744b6456ae7d39a3222e6550d62882586",
+        "Status":  null,
+        "Signer":  null
+    },
+    {
+        "File":  "vigem/ViGEmBus.inf",
+        "SHA256":  "4231781a6db9ccf89987839a7b1ea5eed590b70190ad43cb1c7e03a1fb280bf8",
+        "Status":  null,
+        "Signer":  null
+    },
+    {
+        "File":  "vigem/ViGEmBus.sys",
+        "SHA256":  "b6d6fa5ca8334368fc366a3e78552efb74eef657061371b2de407aa158b0a11c",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    },
+    {
+        "File":  "vigem/vigembus.cat",
+        "SHA256":  "44f7eacb1fc7f61276d508890d9115fca12fe3424afef56d6f975849d7158ff6",
+        "Status":  "Valid",
+        "Signer":  "CN=Microsoft Windows Hardware Compatibility Publisher, O=Microsoft Corporation, L=Redmond, S=Washington, C=US"
+    }
+]

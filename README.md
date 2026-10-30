@@ -51,7 +51,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | built-in CoreAudio driver |
 | Viewer camera | PipeWire camera node (v4l2loopback fallback) | OBS Virtual Camera | — |
 | Viewer gamepad | uinput (Xbox 360) | ViGEmBus (Xbox 360) | — |
-| USB passthrough | vhci-hcd | usbip-win2 (untested) | — |
+| USB passthrough | vhci-hcd | bundled usbip-win2 | — |
 
 Every viewer of a source shares one capture→encode pipeline and one track. Audio is captured once and shared by all viewers.
 
@@ -123,11 +123,22 @@ sudo apt install gcc-mingw-w64-x86-64 nasm
 make windows    # builds static x264 + Opus into third_party/, then bin/urdp.exe
 ```
 
-Viewer devices on Windows need drivers that can't be bundled:
+On Windows x64, run `urdp.exe -install-drivers` once. It requests elevation once,
+installs bundled Microsoft-signed gamepad/USB-IP drivers, and prints whether a
+reboot is needed. Existing working devices are retained. To remove devices and
+packages installed by urdp, run `urdp.exe -uninstall-drivers`; pre-existing
+installations are preserved. No separate driver installer, USB/IP CLI, or VC++
+runtime is required. The compressed driver bundle adds about 246 KiB.
+
+urdp never installs drivers unless you run these commands. Without them, the server tells the viewer which device is missing and what to run.
+See [install testing](docs/windows-drivers.md#install-testing) for exactly what install and uninstall change. Note that USB/IP adds an upper filter driver to every USB 3 root hub.
+
+[Driver versions, licenses, signature evidence, and host test results](docs/windows-drivers.md).
+Viewer devices have these remaining requirements:
 
 - **Microphone.** Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/). urdp plays into "CABLE Input", and apps pick "CABLE Output" as their microphone. Set `URDP_MIC_DEVICE` to use a different render endpoint.
 - **Camera.** Install OBS Studio and register its virtual camera once as Administrator, using `data\obs-plugins\win-dshow\virtualcam-install.bat` in the OBS folder. urdp feeds frames into "OBS Virtual Camera", and OBS doesn't need to be running.
-- **Gamepad.** Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases). Each pad appears as an Xbox 360 controller.
+- **Gamepad.** The bundled ViGEmBus driver exposes each pad as an Xbox 360 controller. Run `urdp.exe -install-drivers` first.
 
 When running `urdp.exe` from WSL, Windows may ask whether to allow it through the firewall. Access from the same machine over loopback works either way. Allow it if you want other machines to connect.
 
@@ -165,7 +176,7 @@ With `-usb`, the viewer can plug a USB device from their own computer into the h
 
 - **Browser:** WebUSB opens the device and claims its interfaces. Each device gets its own reliable `usb` data channel. The server translates every URB into one WebUSB call (`controlTransferIn/Out`, `transferIn/Out`, `isochronousTransferIn/Out`, `selectConfiguration`, `selectAlternateInterface`, `clearHalt` or `reset`). See `internal/usbip/wire.go` for the protocol.
 - **Linux host:** the server speaks USB/IP to the kernel's `vhci-hcd` directly. It gives the kernel one end of a socket pair through `/sys/devices/platform/vhci_hcd.0/attach`, which is what `usbip attach` does. Run `sudo modprobe vhci-hcd` first. Writing that file needs root, or group write access (`chgrp`/`chmod g+w` on `attach` and `detach`).
-- **Windows host:** install [usbip-win2](https://github.com/vadimgrn/usbip-win2) and put `usbip.exe` on PATH. The server runs a one-device USB/IP server on 127.0.0.1 and runs `usbip.exe attach` against it. This path is untested on Windows.
+- **Windows x64 host:** run `urdp.exe -install-drivers` once. The server starts a one-device USB/IP server on 127.0.0.1 and asks the bundled usbip-win2 driver to attach through its native IOCTL ABI. It uses low-latency receive mode and explicitly detaches the assigned virtual port when the viewer disconnects. No `usbip.exe`, DLLs, PATH changes, or VC++ runtime installation is needed. Kernel attach, descriptor requests, and detach have been tested on a Secure Boot Windows host using a simulated browser USB device; arbitrary physical WebUSB devices remain experimental.
 - The device is detached when the viewer unplugs it, the channel closes or the viewer disconnects.
 
 Limits:
