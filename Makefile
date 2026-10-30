@@ -1,7 +1,7 @@
 WIN_ENV = CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
 	PKG_CONFIG_LIBDIR=$(CURDIR)/third_party/windows/lib/pkgconfig
 
-.PHONY: all linux windows windows-deps test vet vet-windows clean
+.PHONY: all linux linux-release windows windows-deps test vet vet-windows clean
 
 all: linux
 
@@ -62,3 +62,31 @@ mac: mac-deps
 	@printf '%s\n' '#!/bin/sh' 'set -e' 'flags=$$(pkg-config --static "$$@")' 'printf "%s\n" "$$flags" | sed "s|-lx264|$(MAC_DEPS)/lib/libx264.a|g; s|-lopus|$(MAC_DEPS)/lib/libopus.a|g"' > bin/pkg-config-darwin
 	@chmod +x bin/pkg-config-darwin
 	MACOSX_DEPLOYMENT_TARGET=13.0 CGO_ENABLED=1 CGO_CFLAGS="-O2 -g -mmacosx-version-min=13.0" PKG_CONFIG_LIBDIR="$(MAC_DEPS)/lib/pkgconfig" PKG_CONFIG_PATH="$(MAC_DEPS)/lib/pkgconfig" PKG_CONFIG="$(CURDIR)/bin/pkg-config-darwin" go build -a -ldflags "-s -w" -o bin/urdp .
+
+# Release build for Linux: codecs linked statically so the binary only
+# needs the X11 and PulseAudio libraries every desktop already has. Distro
+# packages don't ship a static x264, so it's built from source.
+LINUX_DEPS = $(CURDIR)/third_party/linux
+LINUX_STATIC_LIBS = x264 opus vpx
+
+$(LINUX_DEPS)/lib/libx264.a:
+	@mkdir -p $(LINUX_DEPS)/src
+	[ -d $(LINUX_DEPS)/src/x264 ] || git clone --depth 1 --branch stable https://code.videolan.org/videolan/x264.git $(LINUX_DEPS)/src/x264
+	cd $(LINUX_DEPS)/src/x264 && ./configure --prefix=$(LINUX_DEPS) --enable-static --enable-pic --disable-cli
+	$(MAKE) -C $(LINUX_DEPS)/src/x264 -j$$(nproc) install
+
+linux-release: $(LINUX_DEPS)/lib/libx264.a
+	@mkdir -p bin
+	@# Only the codecs are made static (with their private deps); --static on
+	@# everything would also hard-link libpulse's versioned private library.
+	@printf '%s\n' '#!/bin/sh' 'set -e' 'flags=$$(pkg-config "$$@")' \
+		'for l in $(LINUX_STATIC_LIBS); do' \
+		'  case " $$flags " in *" -l$$l "*) ;; *) continue;; esac' \
+		'  a=$$(pkg-config --variable=libdir $$l)/lib$$l.a; [ -f "$$a" ] || continue' \
+		'  priv=$$(pkg-config --static --libs-only-l $$l | sed "s|-l$$l\\b||")' \
+		'  flags=$$(printf "%s" "$$flags" | sed "s|-l$$l\\b|$$a $$priv|")' \
+		'done' \
+		'printf "%s\n" "$$flags"' > bin/pkg-config-static
+	@chmod +x bin/pkg-config-static
+	PKG_CONFIG_PATH=$(LINUX_DEPS)/lib/pkgconfig PKG_CONFIG=$(CURDIR)/bin/pkg-config-static go build -a -ldflags "-s -w" -o bin/urdp .
+	@! readelf -d bin/urdp | grep NEEDED | grep -E 'libx264|libopus|libvpx'

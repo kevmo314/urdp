@@ -1,0 +1,103 @@
+name: release
+
+# Every push to main refreshes the rolling "nightly" prerelease; pushing a
+# v* tag publishes a versioned release. Both carry binaries for all three
+# platforms.
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev \
+            libxdamage-dev libxrandr-dev libx264-dev libopus-dev libvpx-dev libpulse-dev
+      - name: Build
+        run: make linux-release
+      - run: mv bin/urdp urdp-linux-amd64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: urdp-linux-amd64
+
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: third_party/windows
+          key: windows-deps-${{ hashFiles('scripts/build-windows-deps.sh') }}
+      - name: Build
+        run: make windows
+      - run: mv bin/urdp.exe urdp-windows-amd64.exe
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: urdp-windows-amd64.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install dependencies
+        run: brew install pkg-config nasm
+      - uses: actions/cache@v4
+        with:
+          path: third_party/darwin
+          key: darwin-deps-${{ hashFiles('Makefile') }}
+      - name: Build
+        run: make mac
+      - run: mv bin/urdp urdp-macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: urdp-macos-arm64
+
+  publish:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes
+          else
+            gh release delete nightly --yes --cleanup-tag || true
+            gh release create nightly dist/* --prerelease --target "$GITHUB_SHA" \
+              --title "Nightly ($(git rev-parse --short HEAD))" \
+              --notes "Built from $GITHUB_SHA. Not a stable release."
+          fi
