@@ -186,3 +186,92 @@ func TestWindowIconAndApp(t *testing.T) {
 		t.Errorf("pixel (1,1) alpha = %d, want 128", a>>8)
 	}
 }
+
+// After a small change, only the damaged area is copied; the result must
+// match a fresh full capture.
+func TestDirtyRegions(t *testing.T) {
+	needX(t)
+	if _, err := exec.LookPath("xterm"); err != nil {
+		t.Skip("xterm not installed")
+	}
+	src, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	if _, _, err := src.Capture(0); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("xterm", "-geometry", "20x5+300+200", "-e", "sleep", "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer cmd.Process.Kill()
+	time.Sleep(700 * time.Millisecond) // let it map and draw
+	var f *Frame
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); {
+		var changed bool
+		if f, changed, err = src.Capture(100 * time.Millisecond); err != nil {
+			t.Fatal(err)
+		}
+		if !changed {
+			break // settled
+		}
+	}
+	// Drain once more so f reflects everything drawn.
+	f, _, _ = src.Capture(50 * time.Millisecond)
+
+	fresh, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	g, _, err := fresh.Capture(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for y := 0; y < f.Height; y++ {
+		a := f.Pix[y*f.Stride : y*f.Stride+f.Width*4]
+		b := g.Pix[y*g.Stride : y*g.Stride+g.Width*4]
+		for x := 0; x < f.Width; x++ {
+			if a[x*4] != b[x*4] || a[x*4+1] != b[x*4+1] || a[x*4+2] != b[x*4+2] {
+				t.Fatalf("pixel (%d,%d) differs from a full capture", x, y)
+			}
+		}
+	}
+}
+
+func TestDirtyRectsReported(t *testing.T) {
+	needX(t)
+	if _, err := exec.LookPath("xterm"); err != nil {
+		t.Skip("xterm not installed")
+	}
+	src, err := Open("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	src.Capture(0)
+	for deadline := time.Now().Add(2 * time.Second); time.Now().Before(deadline); { // settle
+		if _, changed, _ := src.Capture(100 * time.Millisecond); !changed {
+			break
+		}
+	}
+	cmd := exec.Command("xterm", "-geometry", "10x3+500+400", "-e", "sleep", "30")
+	cmd.Start()
+	defer cmd.Process.Kill()
+	f, changed, err := src.Capture(3 * time.Second)
+	if err != nil || !changed {
+		t.Fatalf("no change after mapping a window: %v", err)
+	}
+	if f.Dirty == nil {
+		t.Skip("X server lacks MIT-SHM pixmaps; full-frame capture only")
+	}
+	area := 0
+	for _, r := range f.Dirty {
+		area += r.Dx() * r.Dy()
+	}
+	if area == 0 || area > f.Width*f.Height/4 {
+		t.Errorf("dirty area %d of %d for a small window: %v", area, f.Width*f.Height, f.Dirty)
+	}
+}

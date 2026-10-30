@@ -17,6 +17,9 @@ type Frame struct {
 	Stride int
 	Width  int
 	Height int
+	// Dirty lists the regions that changed since the previous frame from
+	// the same source. nil means the whole frame may have changed.
+	Dirty []image.Rectangle
 }
 
 // Source produces frames from the desktop or a single window.

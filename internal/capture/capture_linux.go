@@ -1,13 +1,14 @@
 package capture
 
 /*
-#cgo pkg-config: x11 xext xcomposite xdamage xrandr
+#cgo pkg-config: x11 xext xcomposite xdamage xfixes xrandr
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xfixes.h>
 #include <X11/extensions/Xrandr.h>
 #include <poll.h>
 #include <time.h>
@@ -28,9 +29,19 @@ typedef struct {
 	int cx, cy, cw, ch; // crop of the root window (one monitor); cw == 0 for none
 	Damage damage;
 	int damage_event;
+	// With MIT-SHM pixmaps, damaged areas are copied server-side straight
+	// into our shared memory, so small updates cost almost nothing.
+	Pixmap pix;
+	GC gc;
+	XserverRegion parts;  // damage accumulated since the last grab
+	XRectangle *rects;    // dirty rectangles of the last grab, in image coordinates
+	int nrects;           // 0 after a full grab
+	int full;             // next grab must copy everything
 } grabber;
 
 static void grabber_free_image(grabber *g) {
+	if (g->pix) { XFreePixmap(g->dpy, g->pix); g->pix = 0; }
+	if (g->gc) { XFreeGC(g->dpy, g->gc); g->gc = 0; }
 	if (!g->img) return;
 	XShmDetach(g->dpy, &g->shm);
 	XDestroyImage(g->img);
@@ -50,8 +61,16 @@ static int grabber_alloc_image(grabber *g, Visual *vis, int depth, int w, int h)
 	if (g->shm.shmaddr == (char *)-1) { g->img->data = NULL; XDestroyImage(g->img); g->img = NULL; return -1; }
 	g->shm.readOnly = False;
 	if (!XShmAttach(g->dpy, &g->shm)) { shmdt(g->shm.shmaddr); XDestroyImage(g->img); g->img = NULL; return -1; }
+	int maj, min;
+	Bool pixmaps = False;
+	if (XShmQueryVersion(g->dpy, &maj, &min, &pixmaps) && pixmaps && XShmPixmapFormat(g->dpy) == ZPixmap) {
+		g->pix = XShmCreatePixmap(g->dpy, g->target, g->shm.shmaddr, &g->shm, w, h, depth);
+		XGCValues v = { .subwindow_mode = IncludeInferiors, .graphics_exposures = False };
+		g->gc = XCreateGC(g->dpy, g->pix, GCSubwindowMode | GCGraphicsExposures, &v);
+	}
 	XSync(g->dpy, False);
 	g->w = w; g->h = h;
+	g->full = 1;
 	return 0;
 }
 
@@ -76,7 +95,9 @@ static grabber *grabber_open(unsigned long win) {
 	if (XDamageQueryExtension(dpy, &ev, &er)) {
 		g->damage_event = ev + XDamageNotify;
 		g->damage = XDamageCreate(dpy, g->target, XDamageReportNonEmpty);
+		if (XFixesQueryExtension(dpy, &ev, &er)) g->parts = XFixesCreateRegion(dpy, NULL, 0);
 	}
+	g->full = 1;
 	return g;
 }
 
@@ -104,13 +125,23 @@ static int grabber_wait(grabber *g, int timeout_ms) {
 		if (poll(&p, 1, (int)left) <= 0) break;
 	}
 	// Clear before grabbing, so drawing that lands mid-grab re-arms the
-	// notification instead of being lost.
-	if (damaged) XDamageSubtract(g->dpy, g->damage, None, None);
+	// notification instead of being lost. Keep what was damaged so only
+	// that is copied.
+	if (damaged) {
+		if (g->parts) {
+			XDamageSubtract(g->dpy, g->damage, None, g->parts);
+		} else {
+			XDamageSubtract(g->dpy, g->damage, None, None);
+			g->full = 1;
+		}
+	}
 	return damaged;
 }
 
 static void grabber_close(grabber *g) {
 	grabber_free_image(g);
+	if (g->parts) XFixesDestroyRegion(g->dpy, g->parts);
+	if (g->rects) free(g->rects);
 	if (g->damage) XDamageDestroy(g->dpy, g->damage);
 	if (g->win) XCompositeUnredirectWindow(g->dpy, g->win, CompositeRedirectAutomatic);
 	XCloseDisplay(g->dpy);
@@ -153,9 +184,41 @@ static int grabber_grab(grabber *g) {
 	if (!g->img || w != g->w || h != g->h) {
 		if (grabber_alloc_image(g, a.visual, a.depth, w, h)) return -1;
 	}
-	if (!XShmGetImage(g->dpy, g->target, g->img, g->win ? 0 : g->cx, g->win ? 0 : g->cy, AllPlanes)) return -1;
+	int ox = g->win ? 0 : g->cx, oy = g->win ? 0 : g->cy;
+	g->nrects = 0;
+	if (!g->pix) {
+		g->full = 0;
+		return XShmGetImage(g->dpy, g->target, g->img, ox, oy, AllPlanes) ? 0 : -1;
+	}
+	int n = 0;
+	XRectangle *r = NULL;
+	if (!g->full && g->parts) r = XFixesFetchRegion(g->dpy, g->parts, &n);
+	// Copy the damaged rectangles (clipped to the image), or everything
+	// on the first grab, after resizes, or when the damage is fragmented.
+	if (g->full || !r || n == 0 || n > 64) {
+		XCopyArea(g->dpy, g->target, g->pix, g->gc, ox, oy, w, h, 0, 0);
+		g->full = 0;
+	} else {
+		g->rects = realloc(g->rects, n * sizeof(XRectangle));
+		for (int i = 0; i < n; i++) {
+			int x0 = r[i].x - ox, y0 = r[i].y - oy;
+			int x1 = x0 + r[i].width, y1 = y0 + r[i].height;
+			if (x0 < 0) x0 = 0;
+			if (y0 < 0) y0 = 0;
+			if (x1 > w) x1 = w;
+			if (y1 > h) y1 = h;
+			if (x0 >= x1 || y0 >= y1) continue;
+			XCopyArea(g->dpy, g->target, g->pix, g->gc, x0 + ox, y0 + oy, x1 - x0, y1 - y0, x0, y0);
+			g->rects[g->nrects++] = (XRectangle){ x0, y0, x1 - x0, y1 - y0 };
+		}
+	}
+	if (r) XFree(r);
+	// The copy lands in our shared memory only once the server has run it.
+	XSync(g->dpy, False);
 	return 0;
 }
+
+static XRectangle *grabber_rect(grabber *g, int i) { return &g->rects[i]; }
 
 static unsigned char *grabber_data(grabber *g) { return (unsigned char *)g->img->data; }
 static int grabber_stride(grabber *g) { return g->img->bytes_per_line; }
@@ -398,6 +461,13 @@ func (s *x11Source) Capture(wait time.Duration) (*Frame, bool, error) {
 		Stride: stride,
 		Width:  w,
 		Height: h,
+	}
+	if n := int(s.g.nrects); n > 0 {
+		s.frame.Dirty = make([]image.Rectangle, n)
+		for i := range n {
+			r := C.grabber_rect(s.g, C.int(i))
+			s.frame.Dirty[i] = image.Rect(int(r.x), int(r.y), int(r.x)+int(r.width), int(r.y)+int(r.height))
+		}
 	}
 	x, y := int(s.g.x), int(s.g.y)
 	s.rect = image.Rect(x, y, x+w, y+h)

@@ -1,6 +1,8 @@
 package encoder
 
 import (
+	"bytes"
+	"image"
 	"testing"
 
 	"github.com/kevmo314/urdp/internal/capture"
@@ -89,5 +91,47 @@ func TestConvertColors(t *testing.T) {
 	}
 	if u[0] != 128 || u[31*us] != 128 {
 		t.Errorf("chroma white=%d black=%d, want 128", u[0], u[31*int(us)])
+	}
+}
+
+// Converting only the dirty rectangles must give the same picture as
+// converting the whole frame.
+func TestDirtyConversion(t *testing.T) {
+	const w, h = 64, 48
+	frame := func(fill func(x, y int) byte) *capture.Frame {
+		f := &capture.Frame{Pix: make([]byte, w*h*4), Stride: w * 4, Width: w, Height: h}
+		for y := range h {
+			for x := range w {
+				v := fill(x, y)
+				copy(f.Pix[(y*w+x)*4:], []byte{v, v / 2, 255 - v, 255})
+			}
+		}
+		return f
+	}
+	before := frame(func(x, y int) byte { return byte(x * 4) })
+	after := frame(func(x, y int) byte {
+		if x >= 13 && x < 29 && y >= 7 && y < 20 { // odd-aligned change
+			return 200
+		}
+		return byte(x * 4)
+	})
+	after.Dirty = []image.Rectangle{image.Rect(13, 7, 29, 20)}
+
+	partial, _ := New(w, h, Options{})
+	defer partial.Close()
+	partial.Encode(before, 0, true)
+	partial.Encode(after, 33, false)
+
+	full, _ := New(w, h, Options{})
+	defer full.Close()
+	after.Dirty = nil
+	full.Encode(after, 0, true)
+
+	for i := range 3 {
+		a, _ := partial.plane(i)
+		b, _ := full.plane(i)
+		if !bytes.Equal(a, b) {
+			t.Fatalf("plane %d differs between dirty and full conversion", i)
+		}
 	}
 }

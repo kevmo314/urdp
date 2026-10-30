@@ -35,3 +35,21 @@ func BenchmarkConvert1080p(b *testing.B) {
 		enc.convert(f)
 	}
 }
+
+// Content changes every frame (a moving gradient), like scrolling or video.
+func BenchmarkEncode1080pMotion(b *testing.B) {
+	src := capture.NewTestSource(1920, 1080)
+	enc, err := New(1920, 1080, Options{FPS: 60})
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer enc.Close()
+	for i := range b.N {
+		b.StopTimer()
+		f, _, _ := src.Capture(0)
+		b.StartTimer()
+		if _, _, err := enc.Encode(f, int64(i), false); err != nil {
+			b.Fatal(err)
+		}
+	}
+}

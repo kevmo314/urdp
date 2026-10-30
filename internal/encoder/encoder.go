@@ -98,6 +98,15 @@ static void enc_convert(enc *e, const uint8_t *src, int stride, int w, int j0, i
 		im->plane[2] + (size_t)(j0 / 2) * im->i_stride[2], im->i_stride[2]);
 }
 
+// Converts the rectangle at (x, y) of size w x h; all even.
+static void enc_convert_rect(enc *e, const uint8_t *src, int stride, int x, int y, int w, int h) {
+	x264_image_t *im = &e->in.img;
+	bgra_to_i420(src + (size_t)y * stride + (size_t)x * 4, stride, w, h,
+		im->plane[0] + (size_t)y * im->i_stride[0] + x, im->i_stride[0],
+		im->plane[1] + (size_t)(y / 2) * im->i_stride[1] + x / 2, im->i_stride[1],
+		im->plane[2] + (size_t)(y / 2) * im->i_stride[2] + x / 2, im->i_stride[2]);
+}
+
 static uint8_t *enc_plane(enc *e, int i, int *stride) { *stride = e->in.img.i_stride[i]; return e->in.img.plane[i]; }
 
 // Returns encoded byte count (Annex B, all NALs contiguous) or <0 on error.
@@ -125,6 +134,7 @@ import "C"
 
 import (
 	"errors"
+	"image"
 	"runtime"
 	"sync"
 	"unsafe"
@@ -146,7 +156,10 @@ type Encoder struct {
 	e    *C.enc
 	w, h int
 	opts Options
-	buf  []byte
+	// primed is set once the input picture holds a complete frame, after
+	// which frames with dirty rectangles only need those converted.
+	primed bool
+	buf    []byte
 }
 
 // New creates an encoder for w x h frames. Dimensions are rounded down
@@ -165,7 +178,7 @@ func New(w, h int, o Options) (*Encoder, error) {
 	if o.KeyintSeconds <= 0 {
 		o.KeyintSeconds = 5
 	}
-	threads := min(runtime.NumCPU(), 8)
+	threads := min(runtime.NumCPU(), 6)
 	e := C.enc_open(C.int(w), C.int(h), C.int(o.FPS), C.int(o.BitrateKbps), C.int(o.FPS*o.KeyintSeconds), C.int(threads))
 	if e == nil {
 		return nil, errors.New("encoder: x264_encoder_open failed")
@@ -192,7 +205,12 @@ func (e *Encoder) Encode(f *capture.Frame, ptsMs int64, keyframe bool) ([]byte, 
 	if f.Width < e.w || f.Height < e.h {
 		return nil, false, errors.New("encoder: frame smaller than encoder")
 	}
-	e.convert(f)
+	if e.primed && f.Dirty != nil {
+		e.convertDirty(f)
+	} else {
+		e.convert(f)
+		e.primed = true
+	}
 	var out *C.uint8_t
 	n := C.enc_encode(e.e, C.int64_t(ptsMs), cbool(keyframe), &out)
 	if n < 0 {
@@ -207,6 +225,29 @@ func (e *Encoder) Encode(f *capture.Frame, ptsMs int64, keyframe bool) ([]byte, 
 
 // convert fills the encoder's input picture from f, splitting the rows
 // across goroutines; it's memory bound, so a few bands are enough.
+// convertDirty converts only f's changed regions, falling back to a full
+// conversion when they cover most of the frame anyway.
+func (e *Encoder) convertDirty(f *capture.Frame) {
+	bounds := image.Rect(0, 0, e.w, e.h)
+	area := 0
+	for _, r := range f.Dirty {
+		area += r.Intersect(bounds).Dx() * r.Intersect(bounds).Dy()
+	}
+	if area > e.w*e.h/2 {
+		e.convert(f)
+		return
+	}
+	src := (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(f.Pix)))
+	for _, r := range f.Dirty {
+		// 4:2:0 chroma covers 2x2 blocks, so widen to even coordinates.
+		r = image.Rect(r.Min.X&^1, r.Min.Y&^1, (r.Max.X+1)&^1, (r.Max.Y+1)&^1).Intersect(bounds)
+		if r.Empty() {
+			continue
+		}
+		C.enc_convert_rect(e.e, src, C.int(f.Stride), C.int(r.Min.X), C.int(r.Min.Y), C.int(r.Dx()), C.int(r.Dy()))
+	}
+}
+
 func (e *Encoder) convert(f *capture.Frame) {
 	src := (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(f.Pix)))
 	bands := min(4, runtime.NumCPU())
