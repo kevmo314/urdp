@@ -44,7 +44,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Desktop capture | XShm on the root window (cropped per monitor via XRandR) | DXGI Desktop Duplication per output, stitched, dirty rects only | ScreenCaptureKit per display, stitched |
 | Window capture | XComposite-redirected window + XShm | Windows.Graphics.Capture (PrintWindow fallback) | ScreenCaptureKit window filter |
 | Change detection | XDamage | DXGI / WGC frame events | SCFrameStatus |
-| Video encode | libx264 | libx264 (static) | libx264 (static) |
+| Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | libx264 (static) | libx264 (static) |
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
 | Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | built-in CoreAudio driver |
@@ -58,6 +58,7 @@ Every viewer of a source shares one capture→encode pipeline and one track. Aud
 
 - **Event-driven capture.** Capture blocks on XDamage/DXGI until the screen actually changes, then grabs at once. Idle screens cost no encode or bandwidth. The FPS flag is only a cap.
 - **x264 `ultrafast` + `zerolatency`.** No B-frames, no lookahead, sliced threads, one frame in and one frame out. The profile is constrained baseline, so browsers can always hardware-decode it. A VBV cap bounds burst sizes. IDR frames are sent on PLI/FIR and when a viewer joins, plus every `-keyint` seconds.
+- **Other codecs (Linux).** `?codec=av1`, `vp9`, `vp8` or `h265` picks the viewer's codec. VP8/VP9 use libvpx and AV1 uses libaom, all in realtime mode: no lag frames, no frame dropping, CBR with a 100ms buffer, and keyframes only on request or every `-keyint` seconds, so each frame comes out of the encoder as it goes in. On a Ryzen 9 3900X, a 1080p frame where everything changes takes about 4ms with x264, 6ms with VP8, 7–8ms with VP9 and 10ms with AV1. SVT-AV1 2.3 in its low-delay mode took 21ms per frame, so libaom is used. A changing desktop is cheaper than that.
 - **Fast BGRA→I420.** The conversion is vectorized and split across cores: about 0.6ms for a 1080p frame.
 - **Congestion control.** Per viewer, Google Congestion Control (GCC) estimates bandwidth from transport-wide-cc feedback, and the x264 VBV cap is reconfigured on the fly. When several viewers share a source, the slowest one sets the cap. There is no send-side pacer, since one would delay every frame. GCC can't distinguish an idle screen from a slow link, because its estimate never exceeds 1.5× what was received. So the cap follows GCC only while the stream is actually using the bandwidth or GCC sees congestion. In a test with a 4 Mbit/s link and a busy terminal, this cut latency from about 210ms to about 70ms.
 - **Zero playout delay.** The server stamps every video packet with the `playout-delay` RTP header extension (min=max=0), and the client sets `jitterBufferTarget = 0`. Chrome then renders each frame as soon as it's decoded.
@@ -79,12 +80,21 @@ The default probe covers the sender page's paint, capture, encode, network, deco
 
 ```
 sudo apt install pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
-  libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev
+  libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev libaom-dev libva-dev
 make            # bin/urdp
 make test
 ```
 
 Run it inside an X11 session, with `DISPLAY` set. Wayland sessions are not supported yet. Under XWayland only X11 windows are visible.
+
+`make linux-release` links x264, Opus, libvpx and libaom statically. libva is loaded at run time, if it's present.
+
+#### Hardware encoding (VA-API)
+
+H.264 and HEVC can be encoded on the GPU through VA-API (`vaapi-h264`, `vaapi-hevc`). Hardware backends are tried first and fall back to software if the device, driver or profile is missing. Use `-encoder software` to skip them, or `-encoder vaapi-h264` to require one. The low-power (fixed-function) entrypoint is used when the driver has one. Frames are IDR and P only, with CBR and a 100ms HRD buffer (or VBR or CQP when that's all the driver offers). urdp writes the parameter sets and slice headers itself, as FFmpeg does.
+
+- urdp needs read/write access to `/dev/dri/renderD128`, which the `render` group normally gives (`sudo usermod -aG render $USER`), and a VA driver such as `intel-media-va-driver` or `mesa-va-drivers`. `vainfo` lists what the driver can encode. Set `URDP_VAAPI_DEVICE` to use a different render node.
+- **Not yet tested on real hardware.** The packed headers are checked against FFmpeg's parser, but no encode has been run on a GPU. Under WSL2 with kernel 6.18, Mesa's d3d12 VA driver can't initialize, because libdrm doesn't recognize the new `faux` bus that `/dev/dri` sits on.
 
 #### Viewer devices
 
@@ -169,7 +179,7 @@ Limits:
 ```
 main.go                  flags, embeds web/
 internal/capture         Source interface; X11 + Windows backends; synthetic test source
-internal/encoder         libx264 wrapper and BGRA→I420
+internal/encoder         encoder backends (x264, libvpx, libaom, VA-API) and BGRA→YUV
 internal/audio           loopback capture (PulseAudio / WASAPI) and Opus
 internal/input           wire protocol, keymap, XTest / SendInput injectors
 internal/server          HTTP + signaling, shared pipelines, playout-delay interceptor
