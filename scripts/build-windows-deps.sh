@@ -32,3 +32,18 @@ if [[ ! -f "$PREFIX/lib/libopus.a" ]]; then
         make install
     )
 fi
+if [[ ! -f "$PREFIX/lib/libvpx.a" || ! -f "$PREFIX/lib/pkgconfig/vpx.pc" ]]; then
+    if [[ ! -d "$BUILD_DIR/libvpx/.git" ]]; then
+        git clone --depth 1 --branch v1.15.2 https://chromium.googlesource.com/webm/libvpx "$BUILD_DIR/libvpx"
+    fi
+    (
+        cd "$BUILD_DIR/libvpx"
+        if [[ -f vpx_config.h ]]; then make distclean; fi
+        CROSS=x86_64-w64-mingw32- ./configure --target=x86_64-win64-gcc --prefix="$PREFIX" \
+            --enable-static --disable-shared --disable-examples --disable-tools --disable-docs \
+            --disable-unit-tests --disable-multithread --enable-vp8 --disable-vp8-encoder --disable-vp9-encoder \
+            --disable-vp9-decoder
+        make -j"$JOBS"
+        make install
+    )
+fi
