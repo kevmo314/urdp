@@ -111,6 +111,8 @@ jobs:
         run: go vet ./...
       - name: Test
         run: go test ./...
+      - name: Test the audio driver
+        run: make mac-driver-test
       - name: Build static codecs
         run: make mac
       - name: Check runtime dependencies

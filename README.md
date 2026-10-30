@@ -28,7 +28,7 @@ URDP_PASSWORD=hunter2 ./urdp -hosts desk.example.com   # require a password; all
 | Video encode | libx264 | libx264 (static) | libx264 (static) |
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
-| Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | — |
+| Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | built-in CoreAudio driver |
 | Viewer camera | PipeWire camera node (v4l2loopback fallback) | OBS Virtual Camera | — |
 | Viewer gamepad | uinput (Xbox 360) | ViGEmBus (Xbox 360) | — |
 | USB passthrough | vhci-hcd | usbip-win2 (untested) | — |
@@ -107,7 +107,12 @@ When running `urdp.exe` from WSL, Windows may ask whether to allow it through th
 - **Screen & System Audio Recording**, for capture and audio.
 - **Accessibility**, for mouse and keyboard input.
 
-Then restart urdp. Viewer devices aren't implemented on macOS yet.
+Then restart urdp.
+
+#### Viewer devices
+
+- **Microphone.** urdp carries its own CoreAudio driver (an AudioServerPlugIn, ad-hoc signed, built by `make mac`). Install it once with `sudo ./urdp -install-audio-driver`. This copies `urdp-audio.driver` into `/Library/Audio/Plug-Ins/HAL` and restarts `coreaudiod`, which interrupts audio for a moment. Apps then list an input called "urdp Microphone" (48kHz stereo). The device is a loopback: urdp plays the viewer's microphone into its output side, and apps record its input side. Because of that, it also shows up in the output list, but it never becomes the default output. To remove it, run `sudo rm -rf /Library/Audio/Plug-Ins/HAL/urdp-audio.driver && sudo killall coreaudiod`. Apps that record from it need the usual Microphone permission.
+- **Camera and gamepad.** These aren't possible without Apple-issued signing. A virtual camera must be a CoreMediaIO camera extension, and macOS only activates a system extension from an app signed with a Developer ID and the system extension entitlement. The older DAL plug-ins no longer load. A virtual gamepad needs `IOHIDUserDevice`, which requires the restricted `com.apple.developer.hid.virtual.device` entitlement. Without it, creation fails even as root, and an ad-hoc signed binary that claims the entitlement is killed at launch.
 
 ### Networking notes
 
