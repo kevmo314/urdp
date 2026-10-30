@@ -20,6 +20,7 @@ import (
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
 	"github.com/kevmo314/urdp/internal/server"
+	"github.com/kevmo314/urdp/internal/usbip"
 )
 
 //go:embed web
@@ -37,6 +38,7 @@ func main() {
 		hosts     = flag.String("hosts", "", "comma-separated hostnames clients may use to reach the server (IPs and localhost are always allowed)")
 		list      = flag.Bool("list", false, "list capturable windows and exit")
 		password  = flag.String("password", os.Getenv("URDP_PASSWORD"), "require this password (HTTP basic auth, any username); defaults to $URDP_PASSWORD")
+		usb       = flag.Bool("usb", false, "experimental: let viewers attach their USB devices (WebUSB) to this host via USB/IP")
 	)
 	flag.Parse()
 
@@ -68,6 +70,15 @@ func main() {
 	}
 	if *nat1to1 != "" {
 		cfg.NAT1To1IPs = strings.Split(*nat1to1, ",")
+	}
+	if *usb {
+		att, err := usbip.Default()
+		if err != nil {
+			log.Printf("usb: passthrough will fail: %v", err)
+		} else {
+			log.Printf("usb: passthrough enabled; viewers can plug USB devices into this machine")
+		}
+		cfg.USB = att
 	}
 	srv, err := server.New(cfg)
 	if err != nil {

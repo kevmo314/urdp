@@ -8,6 +8,7 @@ import (
 	"github.com/pion/webrtc/v4"
 
 	"github.com/kevmo314/urdp/internal/input"
+	"github.com/kevmo314/urdp/internal/usbip"
 )
 
 // session is one viewer. Input arrives on two data channels: "move"
@@ -20,9 +21,17 @@ type session struct {
 	mu   sync.Mutex
 	disp *input.Dispatcher
 	ctl  *webrtc.DataChannel
+
+	// USB passthrough (usb.go); usb is nil unless running with -usb.
+	usb        usbip.Attacher
+	usbBridges []*usbip.Bridge
 }
 
 func (s *session) onDataChannel(dc *webrtc.DataChannel) {
+	if dc.Label() == "usb" {
+		s.onUSB(dc)
+		return
+	}
 	if dc.Label() == "input" {
 		s.mu.Lock()
 		s.ctl = dc

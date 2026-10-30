@@ -212,6 +212,11 @@ async function updateStats() {
   statsEl.textContent = lines.join('\n');
 }
 
+// ---- USB passthrough (experimental; the server needs -usb) ----
+
+import { setupUSB } from './usb.js';
+setupUSB(hud, () => pc, toast);
+
 // ---- start ----
 
 // Audio playback needs a user gesture, so connect behind a click.
