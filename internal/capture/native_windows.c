@@ -11,6 +11,13 @@
 
 struct capture_native {
     HWND hwnd;
+    UINT adapter_index, output_index;
+    capture_native **outputs;
+    int output_count, next_output;
+    unsigned char *composite;
+    HANDLE poll_timer;
+    int full_update;
+    UINT move_bytes, dirty_bytes;
     capture_rect rect;
     ID3D11Device *device;
     ID3D11DeviceContext *context;
@@ -65,44 +72,40 @@ static HRESULT desktop_init(capture_native *s) {
     HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
     if (FAILED(hr))
         return hr;
-    for (UINT a = 0; SUCCEEDED(IDXGIFactory1_EnumAdapters1(factory, a, &adapter)); ++a) {
-        for (UINT o = 0; SUCCEEDED(IDXGIAdapter1_EnumOutputs(adapter, o, &output)); ++o) {
-            DXGI_OUTPUT_DESC desc;
-            hr = IDXGIOutput_GetDesc(output, &desc);
-            if (SUCCEEDED(hr) && desc.AttachedToDesktop && desc.DesktopCoordinates.left == 0 &&
-                desc.DesktopCoordinates.top == 0) {
-                RECT r = desc.DesktopCoordinates;
-                s->rect =
-                    (capture_rect){r.left, r.top, (r.right - r.left) & ~1, (r.bottom - r.top) & ~1};
-                s->rotation = desc.Rotation;
-                hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0,
-                                       NULL, 0, D3D11_SDK_VERSION, &s->device, NULL, &s->context);
-                if (SUCCEEDED(hr)) {
-                    hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput5, (void **)&output5);
-                    if (SUCCEEDED(hr)) {
-                        const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                        hr = IDXGIOutput5_DuplicateOutput1(output5, (IUnknown *)s->device, 0, 1,
-                                                           &format, &s->dup);
-                    }
-                    if (FAILED(hr)) {
-                        hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1, (void **)&output1);
-                        if (SUCCEEDED(hr))
-                            hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown *)s->device, &s->dup);
-                    }
-                }
-                RELEASE(output5);
-                RELEASE(output1);
-                RELEASE(output);
-                RELEASE(adapter);
-                RELEASE(factory);
-                return hr;
-            }
-            RELEASE(output);
-        }
-        RELEASE(adapter);
+    hr = IDXGIFactory1_EnumAdapters1(factory, s->adapter_index, &adapter);
+    if (SUCCEEDED(hr))
+        hr = IDXGIAdapter1_EnumOutputs(adapter, s->output_index, &output);
+    DXGI_OUTPUT_DESC desc;
+    if (SUCCEEDED(hr))
+        hr = IDXGIOutput_GetDesc(output, &desc);
+    if (SUCCEEDED(hr) && !desc.AttachedToDesktop)
+        hr = DXGI_ERROR_NOT_FOUND;
+    if (SUCCEEDED(hr)) {
+        RECT r = desc.DesktopCoordinates;
+        s->rect = (capture_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
+        s->rotation = desc.Rotation;
+        hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
+                               D3D11_SDK_VERSION, &s->device, NULL, &s->context);
     }
+    if (SUCCEEDED(hr)) {
+        hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput5, (void **)&output5);
+        if (SUCCEEDED(hr)) {
+            const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
+            hr = IDXGIOutput5_DuplicateOutput1(output5, (IUnknown *)s->device, 0, 1, &format,
+                                               &s->dup);
+        }
+        if (FAILED(hr)) {
+            hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput1, (void **)&output1);
+            if (SUCCEEDED(hr))
+                hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown *)s->device, &s->dup);
+        }
+    }
+    RELEASE(output5);
+    RELEASE(output1);
+    RELEASE(output);
+    RELEASE(adapter);
     RELEASE(factory);
-    return DXGI_ERROR_NOT_FOUND;
+    return hr;
 }
 static HRESULT window_bounds(capture_native *s) {
     if (s->hwnd) {
@@ -129,13 +132,86 @@ long capture_bounds(capture_native *s, capture_rect *r) {
     }
     return S_OK;
 }
+long capture_open_display(unsigned int adapter, unsigned int output, capture_native **out) {
+    capture_native *s = calloc(1, sizeof(*s));
+    if (!s)
+        return E_OUTOFMEMORY;
+    s->adapter_index = adapter;
+    s->output_index = output;
+    HRESULT hr = desktop_init(s);
+    if (FAILED(hr)) {
+        capture_close(s);
+        return hr;
+    }
+    *out = s;
+    return S_OK;
+}
+static HRESULT composite_init(capture_native *s) {
+    capture_display *displays = NULL;
+    int count = 0;
+    HRESULT hr = capture_displays(&displays, &count);
+    if (FAILED(hr))
+        return hr;
+    if (!count) {
+        free(displays);
+        return DXGI_ERROR_NOT_FOUND;
+    }
+    s->outputs = calloc(count, sizeof(*s->outputs));
+    if (!s->outputs) {
+        free(displays);
+        return E_OUTOFMEMORY;
+    }
+    s->output_count = count;
+    for (int i = 0; i < count; i++) {
+        hr = capture_open_display(displays[i].adapter, displays[i].output, &s->outputs[i]);
+        if (FAILED(hr))
+            break;
+    }
+    free(displays);
+    return hr;
+}
+// Recompute after a duplication is recreated: mode/position changes can resize
+// the virtual desktop. Rebuild only the CPU canvas; other duplications survive.
+static HRESULT composite_bounds(capture_native *s, int force, int *reset) {
+    capture_rect r = s->outputs[0]->rect;
+    int right = r.x + r.w, bottom = r.y + r.h;
+    for (int i = 1; i < s->output_count; i++) {
+        capture_rect o = s->outputs[i]->rect;
+        if (o.x < r.x)
+            r.x = o.x;
+        if (o.y < r.y)
+            r.y = o.y;
+        if (o.x + o.w > right)
+            right = o.x + o.w;
+        if (o.y + o.h > bottom)
+            bottom = o.y + o.h;
+    }
+    r.w = right - r.x;
+    r.h = bottom - r.y;
+    *reset = force || !s->composite || memcmp(&r, &s->rect, sizeof(r));
+    if (*reset) {
+        size_t size = (size_t)r.w * r.h * 4;
+        unsigned char *p = calloc(1, size);
+        if (!p)
+            return E_OUTOFMEMORY;
+        free(s->composite);
+        s->composite = p;
+        s->rect = r;
+    }
+    s->image = (capture_image){s->composite, r.w * 4, r.w, r.h};
+    return S_OK;
+}
 long capture_open(uint64_t hwnd, capture_native **out) {
     capture_native *s = calloc(1, sizeof(*s));
     if (!s)
         return E_OUTOFMEMORY;
     s->hwnd = (HWND)(uintptr_t)hwnd;
     capture_rect r;
-    HRESULT hr = hwnd ? capture_bounds(s, &r) : desktop_init(s);
+    HRESULT hr = hwnd ? capture_bounds(s, &r) : composite_init(s);
+    if (SUCCEEDED(hr) && !hwnd) {
+        int reset;
+        hr = composite_bounds(s, 0, &reset);
+    }
     if (FAILED(hr)) {
         capture_close(s);
         return hr;
@@ -194,12 +270,12 @@ static HRESULT gdi_frame(capture_native *s) {
         HDC screen = GetDC(NULL);
         if (!screen)
             return E_FAIL;
-        BOOL copied = BitBlt(s->dc, 0, 0, w, h, screen, s->rect.x, s->rect.y,
-                             SRCCOPY | CAPTUREBLT);
+        BOOL copied = BitBlt(s->dc, 0, 0, w, h, screen, s->rect.x, s->rect.y, SRCCOPY | CAPTUREBLT);
         ReleaseDC(NULL, screen);
         if (!copied)
             return E_FAIL;
         GdiFlush();
+        s->full_update = 1;
         s->image = (capture_image){s->pixels, w * 4, w, h};
         return S_OK;
     }
@@ -220,6 +296,24 @@ static HRESULT gdi_frame(capture_native *s) {
         memcpy(s->rotated, s->pixels, size);
     s->image = (capture_image){s->pixels, w * 4, w, h};
     return changed ? S_OK : S_FALSE;
+}
+static RECT update_rect(capture_native *s, UINT i) {
+    UINT moves = s->move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+    return i < moves ? ((DXGI_OUTDUPL_MOVE_RECT *)s->metadata)[i].DestinationRect
+                     : ((RECT *)(s->metadata + s->move_bytes))[i - moves];
+}
+static RECT rotated_rect(capture_native *s, RECT r) {
+    int w = s->rect.w, h = s->rect.h;
+    switch (s->rotation) {
+    case DXGI_MODE_ROTATION_ROTATE90:
+        return (RECT){w - r.bottom, r.left, w - r.top, r.right};
+    case DXGI_MODE_ROTATION_ROTATE180:
+        return (RECT){w - r.right, h - r.bottom, w - r.left, h - r.top};
+    case DXGI_MODE_ROTATION_ROTATE270:
+        return (RECT){r.top, h - r.right, r.bottom, h - r.left};
+    default:
+        return r;
+    }
 }
 // Keep the readback mapped until a newer image replaces it. Timeouts retain the
 // previous mapping so keyframes can still encode the last image without a copy.
@@ -243,6 +337,7 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
             RELEASE(s->staging);
     }
     int full = !s->staging;
+    s->move_bytes = s->dirty_bytes = 0;
     HRESULT hr = S_OK;
     if (!s->staging) {
         desc.Usage = D3D11_USAGE_STAGING;
@@ -256,9 +351,7 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     if (box)
         ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging, 0, 0, 0,
                                                   0, (ID3D11Resource *)texture, 0, box);
-    else if (!full && info && info->TotalMetadataBufferSize &&
-             (s->rotation == DXGI_MODE_ROTATION_IDENTITY ||
-              s->rotation == DXGI_MODE_ROTATION_UNSPECIFIED)) {
+    else if (!full && info && info->TotalMetadataBufferSize) {
         if (info->TotalMetadataBufferSize > s->metadata_size) {
             unsigned char *p = realloc(s->metadata, info->TotalMetadataBufferSize);
             if (!p)
@@ -273,13 +366,13 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
             hr = IDXGIOutputDuplication_GetFrameDirtyRects(s->dup, s->metadata_size - moves,
                                                            (RECT *)(s->metadata + moves), &dirty);
         if (SUCCEEDED(hr)) {
+            s->move_bytes = moves;
+            s->dirty_bytes = dirty;
             // Read move destinations from the current desktop texture. This also
             // handles overlapping moves without a temporary CPU image.
             for (UINT i = 0; i < moves / sizeof(DXGI_OUTDUPL_MOVE_RECT) + dirty / sizeof(RECT);
                  i++) {
-                UINT count = moves / sizeof(DXGI_OUTDUPL_MOVE_RECT);
-                RECT r = i < count ? ((DXGI_OUTDUPL_MOVE_RECT *)s->metadata)[i].DestinationRect
-                                   : ((RECT *)(s->metadata + moves))[i - count];
+                RECT r = update_rect(s, i);
                 D3D11_BOX region = {r.left, r.top, 0, r.right, r.bottom, 1};
                 ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging,
                                                           0, r.left, r.top, 0,
@@ -292,6 +385,7 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     if (full && !box)
         ID3D11DeviceContext_CopyResource(s->context, (ID3D11Resource *)s->staging,
                                          (ID3D11Resource *)texture);
+    s->full_update = full || box != NULL;
     D3D11_MAPPED_SUBRESOURCE map;
     hr = ID3D11DeviceContext_Map(s->context, (ID3D11Resource *)s->staging, 0, D3D11_MAP_READ, 0,
                                  &map);
@@ -312,33 +406,55 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
         s->rotated = p;
         s->rotated_size = size;
     }
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            int sx = x, sy = y;
-            switch (s->rotation) {
-            case DXGI_MODE_ROTATION_ROTATE90:
-                sx = y;
-                sy = d.Height - 1 - x;
-                break;
-            case DXGI_MODE_ROTATION_ROTATE180:
-                sx = d.Width - 1 - x;
-                sy = d.Height - 1 - y;
-                break;
-            case DXGI_MODE_ROTATION_ROTATE270:
-                sx = d.Width - 1 - y;
-                sy = x;
-                break;
-            default:
-                break;
+    UINT count = s->full_update ? 1
+                                : s->move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT) +
+                                      s->dirty_bytes / sizeof(RECT);
+    for (UINT i = 0; i < count; i++) {
+        RECT r = s->full_update ? (RECT){0, 0, w, h} : rotated_rect(s, update_rect(s, i));
+        if (r.left < 0)
+            r.left = 0;
+        if (r.top < 0)
+            r.top = 0;
+        if (r.right > w)
+            r.right = w;
+        if (r.bottom > h)
+            r.bottom = h;
+        for (int y = r.top; y < r.bottom; y++)
+            for (int x = r.left; x < r.right; x++) {
+                int sx = x, sy = y;
+                switch (s->rotation) {
+                case DXGI_MODE_ROTATION_ROTATE90:
+                    sx = y;
+                    sy = d.Height - 1 - x;
+                    break;
+                case DXGI_MODE_ROTATION_ROTATE180:
+                    sx = d.Width - 1 - x;
+                    sy = d.Height - 1 - y;
+                    break;
+                case DXGI_MODE_ROTATION_ROTATE270:
+                    sx = d.Width - 1 - y;
+                    sy = x;
+                    break;
+                default:
+                    break;
+                }
+                memcpy(s->rotated + ((size_t)y * w + x) * 4,
+                       (char *)map.pData + (size_t)sy * map.RowPitch + sx * 4, 4);
             }
-            memcpy(s->rotated + ((size_t)y * w + x) * 4,
-                   (char *)map.pData + (size_t)sy * map.RowPitch + sx * 4, 4);
-        }
+    }
     unmap(s);
     s->image = (capture_image){s->rotated, w * 4, w, h};
     return S_OK;
 }
+static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms);
 long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms) {
+    if (s->outputs) {
+        HRESULT hr = composite_frame(s, timeout_ms);
+        *image = s->image;
+        return hr;
+    }
+    s->full_update = 0;
+    s->move_bytes = s->dirty_bytes = 0;
     HRESULT hr;
     if (s->hwnd) {
         hr = window_bounds(s);
@@ -408,9 +524,96 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
     *image = s->image;
     return hr;
 }
+// Metadata rectangles use the unrotated duplication surface. Rotate their
+// edges into desktop orientation, then copy just those rows into the canvas.
+static void composite_copy(capture_native *s, capture_native *o, RECT r, int rotate) {
+    int w = o->rect.w, h = o->rect.h;
+    if (rotate)
+        r = rotated_rect(o, r);
+    if (r.left < 0)
+        r.left = 0;
+    if (r.top < 0)
+        r.top = 0;
+    if (r.right > w)
+        r.right = w;
+    if (r.bottom > h)
+        r.bottom = h;
+    if (r.right <= r.left || r.bottom <= r.top || !o->image.pixels)
+        return;
+    int x = o->rect.x - s->rect.x, y = o->rect.y - s->rect.y;
+    for (int row = r.top; row < r.bottom; row++)
+        memcpy(s->composite + (size_t)(y + row) * s->image.stride + (x + r.left) * 4,
+               o->image.pixels + (size_t)row * o->image.stride + r.left * 4,
+               (size_t)(r.right - r.left) * 4);
+}
+static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms) {
+    LARGE_INTEGER frequency, start, now;
+    QueryPerformanceFrequency(&frequency);
+    QueryPerformanceCounter(&start);
+    for (;;) {
+        int changed = 0;
+        for (int n = 0; n < s->output_count; n++) {
+            int i = (s->next_output + n) % s->output_count;
+            capture_native *o = s->outputs[i];
+            capture_image image;
+            capture_rect previous = o->rect;
+            HRESULT hr = capture_frame(o, &image, 0);
+            if (FAILED(hr))
+                return hr;
+            int reset;
+            hr = composite_bounds(s, memcmp(&previous, &o->rect, sizeof(previous)), &reset);
+            if (FAILED(hr))
+                return hr;
+            if (reset) {
+                for (int j = 0; j < s->output_count; j++) {
+                    capture_native *other = s->outputs[j];
+                    composite_copy(s, other, (RECT){0, 0, other->rect.w, other->rect.h}, 0);
+                }
+                changed = 1;
+            }
+            // A timeout retains the same pixels; full_update is cleared after use.
+            if (o->full_update) {
+                composite_copy(s, o, (RECT){0, 0, o->rect.w, o->rect.h}, 0);
+                changed = 1;
+            } else if (o->move_bytes || o->dirty_bytes) {
+                UINT moves = o->move_bytes / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+                UINT dirty = o->dirty_bytes / sizeof(RECT);
+                for (UINT j = 0; j < moves + dirty; j++) {
+                    RECT r = update_rect(o, j);
+                    composite_copy(s, o, r, 1);
+                }
+                changed = 1;
+            }
+            o->full_update = 0;
+            o->move_bytes = o->dirty_bytes = 0;
+        }
+        s->next_output = (s->next_output + 1) % s->output_count;
+        if (changed)
+            return S_OK;
+        QueryPerformanceCounter(&now);
+        if ((now.QuadPart - start.QuadPart) * 1000 >= (LONGLONG)timeout_ms * frequency.QuadPart)
+            return S_FALSE;
+        // A waitable timer avoids Sleep(1)'s ~15.6ms default timer granularity,
+        // without changing the process/system timer resolution.
+        LARGE_INTEGER due = {.QuadPart = -10000};
+        if (!s->poll_timer)
+            s->poll_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                                     TIMER_ALL_ACCESS);
+        if (s->poll_timer && SetWaitableTimer(s->poll_timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(s->poll_timer, INFINITE);
+        else
+            Sleep(1);
+    }
+}
 void capture_close(capture_native *s) {
     if (!s)
         return;
+    for (int i = 0; i < s->output_count; i++)
+        capture_close(s->outputs[i]);
+    free(s->outputs);
+    free(s->composite);
+    if (s->poll_timer)
+        CloseHandle(s->poll_timer);
     capture_wgc_close(s->wgc);
     unmap(s);
     RELEASE(s->staging);

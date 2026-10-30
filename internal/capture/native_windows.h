@@ -13,6 +13,14 @@ typedef struct {
     char app[1024];
     int w, h;
 } capture_window;
+typedef struct {
+    unsigned int adapter, output;
+    capture_rect rect;
+    int primary;
+    char device[128], name[512];
+} capture_display;
+long capture_displays(capture_display **out, int *count);
+long capture_open_display(unsigned int adapter, unsigned int output, capture_native **out);
 void capture_dpi(void);
 long capture_open(uint64_t hwnd, capture_native **out);
 long capture_bounds(capture_native *s, capture_rect *r);
