@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"image"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -43,9 +44,23 @@ func (f *fakeInjector) Key(k input.Key, down bool) error {
 func (f *fakeInjector) Focus(uint64) error { return nil }
 func (f *fakeInjector) Close() error       { return nil }
 
-func newTestServer(t *testing.T, inj *fakeInjector) (*Server, *httptest.Server) {
+// toneSource yields a real-time paced 440Hz tone.
+type toneSource struct{ n int }
+
+func (s *toneSource) Read(buf []int16) error {
+	time.Sleep(audio.FrameMs * time.Millisecond)
+	for i := 0; i < len(buf); i += audio.Channels {
+		v := int16(8000 * math.Sin(2*math.Pi*440*float64(s.n)/audio.SampleRate))
+		buf[i], buf[i+1] = v, v
+		s.n++
+	}
+	return nil
+}
+func (s *toneSource) Close() error { return nil }
+
+func newTestServer(t *testing.T, inj *fakeInjector, opts ...func(*Config)) (*Server, *httptest.Server) {
 	t.Helper()
-	s, err := New(Config{
+	cfg := Config{
 		Encoder:    encoder.Options{FPS: 30},
 		OpenSource: func(string) (capture.Source, error) { return capture.NewTestSource(320, 240), nil },
 		ListWindows: func() ([]capture.Window, error) {
@@ -53,7 +68,11 @@ func newTestServer(t *testing.T, inj *fakeInjector) (*Server, *httptest.Server) 
 		},
 		NewInjector: func() (input.Injector, error) { return inj, nil },
 		OpenAudio:   func() (audio.Source, error) { return nil, errors.New("no audio in tests") },
-	})
+	}
+	for _, o := range opts {
+		o(&cfg)
+	}
+	s, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,5 +227,62 @@ func TestWindowsAPI(t *testing.T) {
 	}
 	if len(wins) != 1 || wins[0].Path != "/0x1234" {
 		t.Fatalf("windows = %+v", wins)
+	}
+}
+
+func TestAudio(t *testing.T) {
+	_, ts := newTestServer(t, &fakeInjector{}, func(c *Config) {
+		c.AudioKbps = 64
+		c.OpenAudio = func() (audio.Source, error) { return &toneSource{}, nil }
+	})
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	for _, k := range []webrtc.RTPCodecType{webrtc.RTPCodecTypeVideo, webrtc.RTPCodecTypeAudio} {
+		if _, err := pc.AddTransceiverFromKind(k, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got := make(chan int, 1)
+	pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		if tr.Kind() != webrtc.RTPCodecTypeAudio {
+			return
+		}
+		n := 0
+		for {
+			pkt, _, err := tr.ReadRTP()
+			if err != nil {
+				return
+			}
+			// A 440Hz tone needs real payload, not Opus DTX/silence frames.
+			if len(pkt.Payload) > 20 {
+				n++
+			}
+			if n == 50 {
+				got <- int(tr.Codec().ClockRate)
+				return
+			}
+		}
+	})
+	offer, _ := pc.CreateOffer(nil)
+	done := webrtc.GatheringCompletePromise(pc)
+	pc.SetLocalDescription(offer)
+	<-done
+	body, _ := json.Marshal(pc.LocalDescription())
+	res, err := http.Post(ts.URL+"/api/offer", "application/json", bytes.NewReader(body))
+	if err != nil || res.StatusCode != 200 {
+		t.Fatalf("offer: %v %v", err, res.Status)
+	}
+	var answer webrtc.SessionDescription
+	json.NewDecoder(res.Body).Decode(&answer)
+	if err := pc.SetRemoteDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-got:
+	case <-time.After(10 * time.Second):
+		t.Fatal("no audio received")
 	}
 }
