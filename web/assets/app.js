@@ -48,7 +48,7 @@ async function negotiate(pc) {
   move.onbufferedamountlow = flushMove;
   input.onmessage = (e) => {
     const m = JSON.parse(e.data);
-    if (m.t === 'ended') toast('Source closed');
+    if (m.t === 'ended') sourceGone();
   };
 
   pc.ontrack = (e) => {
@@ -67,6 +67,7 @@ async function negotiate(pc) {
   };
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
+    if (!gate.hidden) return; // left this stream for the listing
     if (s === 'connected') toast('');
     else if (s === 'failed' || s === 'disconnected') toast(`Connection ${s} — reconnecting…`);
     // "disconnected" often heals by itself; give it a moment.
@@ -85,6 +86,7 @@ async function negotiate(pc) {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(pc.localDescription),
   });
+  if (res.status === 404) return sourceGone();
   if (!res.ok) throw new Error(await res.text());
   await pc.setRemoteDescription(await res.json());
 }
@@ -100,7 +102,26 @@ function gatheringComplete(pc) {
   });
 }
 
+// The streamed window was closed (or no longer exists): drop back to the
+// source listing rather than retrying.
+function sourceGone() {
+  const gone = source;
+  pc?.close();
+  pc = undefined;
+  video.srcObject = null;
+  history.replaceState(null, '', '/' + location.search);
+  source = '';
+  gate.hidden = false;
+  hud.hidden = true;
+  document.getElementById('start').textContent = 'Connect to desktop';
+  document.getElementById('back').hidden = true;
+  showTree();
+  toast(`/${gone} was closed`);
+  setTimeout(() => toast(''), 4000);
+}
+
 async function reconnect() {
+  if (!gate.hidden) return; // back at the listing; nothing to reconnect
   pc?.close();
   prev = undefined;
   try { await connect(); } catch (e) { toast(`Error: ${e.message}`); setTimeout(reconnect, 2000); }
@@ -431,8 +452,14 @@ if (source) {
 } else {
   document.getElementById('start').textContent = 'Connect to desktop';
 }
-loadTree();
-const treeTimer = setInterval(() => (gate.hidden ? clearInterval(treeTimer) : loadTree()), 2000);
+// Refresh the listing while it's on screen.
+let treeTimer;
+function showTree() {
+  loadTree();
+  clearInterval(treeTimer);
+  treeTimer = setInterval(() => (gate.hidden ? clearInterval(treeTimer) : loadTree()), 2000);
+}
+showTree();
 
 // ---- latency probe ----
 // With ?probe, while viewing this machine's own desktop, the page paints a
