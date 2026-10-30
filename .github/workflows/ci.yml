@@ -17,7 +17,26 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
-            libx264-dev libopus-dev libpulse-dev xvfb xterm xdotool
+            libx264-dev libopus-dev libpulse-dev libvpx-dev xvfb xterm xdotool \
+            pulseaudio pulseaudio-utils ffmpeg
+      # The virtual device tests skip themselves if these fail.
+      - name: Virtual device setup (uinput, PulseAudio)
+        continue-on-error: true
+        run: |
+          sudo modprobe uinput
+          sudo chmod 666 /dev/uinput
+          echo 'KERNEL=="event*", ATTRS{name}=="Microsoft X-Box 360 pad", MODE="0666"' |
+            sudo tee /etc/udev/rules.d/99-urdp-test.rules
+          sudo udevadm control --reload-rules
+          pulseaudio --start --exit-idle-time=-1
+          pactl info
+      - name: Virtual device setup (v4l2loopback)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y linux-headers-$(uname -r) linux-modules-extra-$(uname -r) v4l2loopback-dkms
+          sudo modprobe v4l2loopback exclusive_caps=1 card_label="urdp Camera"
+          sudo chmod 666 /dev/video*
+          ls -l /dev/video*
       - name: Vet
         run: go vet ./...
       - name: Check formatting

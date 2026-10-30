@@ -50,12 +50,26 @@ That number covers the sender page's paint, capture, encode, network, decode, an
 
 ```
 sudo apt install pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
-  libx264-dev libopus-dev libpulse-dev
+  libx264-dev libopus-dev libpulse-dev libvpx-dev
 make            # bin/urdp
 make test
 ```
 
 Run it inside an X11 session, with `DISPLAY` set. Wayland sessions are not supported yet. Under XWayland only X11 windows are visible.
+
+#### Viewer devices
+
+The viewer's microphone, webcam and gamepads can appear on the host as virtual devices. Each device needs some host setup:
+
+- **Microphone.** Needs PulseAudio or PipeWire's pulse server. While a viewer shares their mic, urdp loads a null sink and a remapped source. Apps then list it as an input called "urdp Microphone". The modules are unloaded when the last viewer stops.
+- **Camera.** Needs v4l2loopback: `sudo apt install v4l2loopback-dkms`, then `sudo modprobe v4l2loopback exclusive_caps=1 card_label="urdp Camera"`. To load it at boot, put `v4l2loopback` in `/etc/modules-load.d/` and the options in `/etc/modprobe.d/`. urdp picks the device labelled "urdp Camera", or else any loopback device. Your user needs write access to it, which the `video` group normally gives.
+- **Gamepad.** Each pad becomes a virtual Xbox 360 controller through `/dev/uinput`, which is root-only by default. To allow access, add a udev rule and join the `input` group, then log in again:
+
+  ```
+  echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | sudo tee /etc/udev/rules.d/60-urdp-uinput.rules
+  sudo udevadm control --reload && sudo udevadm trigger /dev/uinput
+  sudo usermod -aG input $USER
+  ```
 
 ### Windows
 
