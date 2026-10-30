@@ -55,9 +55,31 @@ $(MAC_DEPS)/lib/libopus.a:
 	MACOSX_DEPLOYMENT_TARGET=13.0 $(MAKE) -C $(MAC_DEPS)/src/opus-$(MAC_OPUS_VERSION) -j$$(sysctl -n hw.logicalcpu)
 	MACOSX_DEPLOYMENT_TARGET=13.0 $(MAKE) -C $(MAC_DEPS)/src/opus-$(MAC_OPUS_VERSION) install
 
+# The "urdp Microphone" CoreAudio driver, embedded into bin/urdp and
+# installed with `sudo urdp -install-audio-driver`. Ad-hoc signed.
+MAC_DRIVER_SRC = internal/vdev/macdriver/src
+MAC_DRIVER = internal/vdev/macdriver/build/urdp-audio.driver
+
+.PHONY: mac-driver
+mac-driver:
+	rm -rf $(MAC_DRIVER)
+	mkdir -p $(MAC_DRIVER)/Contents/MacOS
+	cp $(MAC_DRIVER_SRC)/Info.plist $(MAC_DRIVER)/Contents/
+	clang -O2 -Wall -Werror -bundle -arch arm64 -arch x86_64 -mmacosx-version-min=13.0 \
+		-framework CoreAudio -framework CoreFoundation \
+		-o $(MAC_DRIVER)/Contents/MacOS/urdp_audio $(MAC_DRIVER_SRC)/urdp_audio.c
+	codesign --force --sign - --timestamp=none $(MAC_DRIVER)
+
+.PHONY: mac-driver-test
+mac-driver-test:
+	@mkdir -p bin
+	clang -O1 -g -Wall -Werror -fsanitize=address,undefined -framework CoreAudio -framework CoreFoundation \
+		-o bin/urdp_audio_test $(MAC_DRIVER_SRC)/urdp_audio_test.c
+	bin/urdp_audio_test
+
 # --static alone emits -lfoo, which prefers a dylib if one exists. Replace
 # those flags with archive paths, and rebuild cgo to avoid cached dynamic flags.
-mac: mac-deps
+mac: mac-deps mac-driver
 	@mkdir -p bin
 	@printf '%s\n' '#!/bin/sh' 'set -e' 'flags=$$(pkg-config --static "$$@")' 'printf "%s\n" "$$flags" | sed "s|-lx264|$(MAC_DEPS)/lib/libx264.a|g; s|-lopus|$(MAC_DEPS)/lib/libopus.a|g"' > bin/pkg-config-darwin
 	@chmod +x bin/pkg-config-darwin

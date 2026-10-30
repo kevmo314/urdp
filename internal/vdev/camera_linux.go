@@ -49,6 +49,7 @@ import "C"
 import (
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -60,9 +61,37 @@ import (
 
 const cameraLabel = "urdp Camera"
 
-var errNoLoopback = fmt.Errorf("%w: no v4l2loopback device found; install it with "+
-	"`sudo apt install v4l2loopback-dkms` and load it with "+
-	"`sudo modprobe v4l2loopback exclusive_caps=1 card_label=\"urdp Camera\"`", ErrUnsupported)
+var errNoLoopback = errors.New("no v4l2loopback device found (for V4L2-only apps: " +
+	"`sudo apt install v4l2loopback-dkms && " +
+	"sudo modprobe v4l2loopback exclusive_caps=1 card_label=\"urdp Camera\"`)")
+
+// openCamera prefers a PipeWire camera node, which needs no kernel module
+// and is what browsers (via the camera portal) and OBS use. v4l2loopback
+// is the fallback, and the only option V4L2-only apps can see without
+// a PipeWire V4L2 shim. URDP_CAMERA=v4l2 or =pipewire picks one.
+func openCamera() (Camera, error) {
+	backend := os.Getenv("URDP_CAMERA")
+	if backend == "v4l2" {
+		c, err := openLoopbackCamera()
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
+		}
+		return c, nil
+	}
+	pc, perr := openPipeWireCamera()
+	if perr == nil {
+		return pc, nil
+	}
+	if backend == "pipewire" {
+		return nil, fmt.Errorf("%w: PipeWire camera unavailable: %v", ErrUnsupported, perr)
+	}
+	lc, lerr := openLoopbackCamera()
+	if lerr == nil {
+		return lc, nil
+	}
+	return nil, fmt.Errorf("%w: PipeWire camera unavailable (%v; start PipeWire, e.g. "+
+		"`systemctl --user start pipewire wireplumber`); %v", ErrUnsupported, perr, lerr)
+}
 
 var (
 	camMu    sync.Mutex
@@ -87,7 +116,7 @@ func videoDevices() []string {
 	return paths
 }
 
-func openCamera() (Camera, error) {
+func openLoopbackCamera() (Camera, error) {
 	camMu.Lock()
 	defer camMu.Unlock()
 	type cand struct {
@@ -106,7 +135,7 @@ func openCamera() (Camera, error) {
 		fd := int(C.cam_probe(cp, &card[0], C.int(len(card))))
 		C.free(unsafe.Pointer(cp))
 		if fd == -int(syscall.EACCES) {
-			permErr = fmt.Errorf("%w: %s is not accessible; add your user to the video group", ErrUnsupported, p)
+			permErr = fmt.Errorf("v4l2loopback device %s is not accessible; add your user to the video group", p)
 		}
 		if fd < 0 {
 			continue

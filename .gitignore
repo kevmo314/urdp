@@ -2,3 +2,5 @@ third_party/
 bin/
 *.exe
 .claude/
+/internal/vdev/macdriver/build/*
+!/internal/vdev/macdriver/build/.keep
