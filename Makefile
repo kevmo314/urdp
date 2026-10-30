@@ -1,4 +1,4 @@
-WIN_ENV = CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc \
+WIN_ENV = CGO_ENABLED=1 GOOS=windows GOARCH=amd64 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
 	PKG_CONFIG_LIBDIR=$(CURDIR)/third_party/windows/lib/pkgconfig
 
 .PHONY: all linux windows windows-deps test vet vet-windows clean

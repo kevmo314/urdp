@@ -41,7 +41,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Install toolchain
-        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 nasm pkg-config
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm pkg-config
       - uses: actions/cache@v4
         with:
           path: third_party/windows
