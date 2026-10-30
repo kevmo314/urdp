@@ -67,7 +67,7 @@ mac: mac-deps
 # needs the X11 and PulseAudio libraries every desktop already has. Distro
 # packages don't ship a static x264, so it's built from source.
 LINUX_DEPS = $(CURDIR)/third_party/linux
-LINUX_STATIC_LIBS = x264 opus vpx
+LINUX_STATIC_LIBS = x264 opus vpx aom
 
 $(LINUX_DEPS)/lib/libx264.a:
 	@mkdir -p $(LINUX_DEPS)/src
@@ -91,4 +91,4 @@ linux-release: $(LINUX_DEPS)/lib/libx264.a
 		'printf "%s\n" "$$flags"' > bin/pkg-config-static
 	@chmod +x bin/pkg-config-static
 	PKG_CONFIG_PATH=$(LINUX_DEPS)/lib/pkgconfig PKG_CONFIG=$(CURDIR)/bin/pkg-config-static go build -a -ldflags "-s -w" -o bin/urdp .
-	@! readelf -d bin/urdp | grep NEEDED | grep -E 'libx264|libopus|libvpx'
+	@! readelf -d bin/urdp | grep NEEDED | grep -E 'libx264|libopus|libvpx|libaom|libva'

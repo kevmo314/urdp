@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev libxrandr-dev \
-            libx264-dev libopus-dev libpulse-dev libvpx-dev xvfb xterm xdotool \
+            libx264-dev libopus-dev libpulse-dev libvpx-dev libaom-dev libva-dev xvfb xterm xdotool \
             pulseaudio pulseaudio-utils ffmpeg
       # The virtual device tests skip themselves if these fail.
       - name: Virtual device setup (uinput, PulseAudio)
@@ -52,6 +52,9 @@ jobs:
           DISPLAY=:99 ./urdp -addr 127.0.0.1:8000 -audio 0 &
           sleep 1
           DISPLAY=:99 node scripts/e2e.mjs 'http://localhost:8000/?probe' 12 250
+          for codec in av1 vp9 vp8; do
+            DISPLAY=:99 node scripts/e2e.mjs "http://localhost:8000/?probe&codec=$codec" 8 250
+          done
       - uses: actions/upload-artifact@v4
         with:
           name: urdp-linux-amd64
