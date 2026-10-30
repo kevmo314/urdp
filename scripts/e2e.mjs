@@ -16,7 +16,12 @@ const chrome = spawn(chromeBin, ['--kiosk', '--no-first-run', '--no-default-brow
   '--autoplay-policy=no-user-gesture-required',
   `--user-data-dir=${profile}`, `--remote-debugging-port=${port}`, url], { stdio: 'ignore' });
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const done = (code) => { chrome.kill(); rmSync(profile, { recursive: true, force: true }); process.exit(code); };
+const done = async (code) => {
+  chrome.kill();
+  await new Promise((r) => chrome.once('exit', r));
+  try { rmSync(profile, { recursive: true, force: true, maxRetries: 5 }); } catch { /* best effort */ }
+  process.exit(code);
+};
 
 let ws;
 for (let i = 0; i < 100 && !ws; i++) {
@@ -26,7 +31,7 @@ for (let i = 0; i < 100 && !ws; i++) {
     if (page) ws = new WebSocket(page.webSocketDebuggerUrl);
   } catch { /* not up yet */ }
 }
-if (!ws) { console.error('chrome did not start'); done(1); }
+if (!ws) { console.error('chrome did not start'); await done(1); }
 await new Promise((r) => ws.addEventListener('open', r));
 let id = 0;
 const pending = new Map();
@@ -48,8 +53,8 @@ for (let i = 0; i < +secs; i++) {
   if (m) p50s.push(+m[1]);
 }
 const width = await evaluate("document.getElementById('video').videoWidth");
-if (!width) { console.error('no video decoded'); done(1); }
-if (!p50s.length) { console.error('latency probe produced no samples'); done(1); }
+if (!width) { console.error('no video decoded'); await done(1); }
+if (!p50s.length) { console.error('latency probe produced no samples'); await done(1); }
 const median = p50s.sort((a, b) => a - b)[p50s.length >> 1];
 console.log(`median e2e p50: ${median}ms (ceiling ${maxP50}ms)`);
-done(median <= +maxP50 ? 0 : 1);
+await done(median <= +maxP50 ? 0 : 1);
