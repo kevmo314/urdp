@@ -8,6 +8,7 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -284,5 +285,40 @@ func TestAudio(t *testing.T) {
 	case <-got:
 	case <-time.After(10 * time.Second):
 		t.Fatal("no audio received")
+	}
+}
+
+func TestRequestFiltering(t *testing.T) {
+	s, _ := newTestServer(t, &fakeInjector{}, func(c *Config) { c.AllowedHosts = []string{"desk.example.com"} })
+	cases := []struct {
+		host, fetchSite string
+		want            bool
+	}{
+		{"localhost:8000", "", true},
+		{"127.0.0.1:8000", "same-origin", true},
+		{"[::1]:8000", "none", true},
+		{"192.168.1.5:8000", "", true},
+		{"desk.example.com:8000", "", true},
+		{"evil.example.com:8000", "", false}, // DNS rebinding
+		{"localhost:8000", "cross-site", false},
+		{"localhost:8000", "same-site", false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest("GET", "/api/windows", nil)
+		r.Host = c.host
+		if c.fetchSite != "" {
+			r.Header.Set("Sec-Fetch-Site", c.fetchSite)
+		}
+		if got := s.allowedRequest(r); got != c.want {
+			t.Errorf("host %q site %q: allowed=%v, want %v", c.host, c.fetchSite, got, c.want)
+		}
+	}
+	// Offers must be JSON, which cross-origin pages can't send without a preflight.
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/api/offer", strings.NewReader("{}"))
+	r.Host = "localhost"
+	s.ServeHTTP(w, r)
+	if w.Code != http.StatusUnsupportedMediaType {
+		t.Errorf("text/plain offer: status %d, want 415", w.Code)
 	}
 }

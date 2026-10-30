@@ -7,11 +7,7 @@ package input
 #include <X11/extensions/XTest.h>
 #include <string.h>
 
-static int ignore_errors(Display *d, XErrorEvent *e) { return 0; }
-
 static Display *xt_open(void) {
-	XInitThreads();
-	XSetErrorHandler(ignore_errors);
 	Display *d = XOpenDisplay(NULL);
 	if (!d) return NULL;
 	int ev, er, maj, min;
@@ -21,6 +17,14 @@ static Display *xt_open(void) {
 
 static void xt_move(Display *d, int x, int y) { XTestFakeMotionEvent(d, -1, x, y, CurrentTime); XFlush(d); }
 static void xt_button(Display *d, unsigned int b, int down) { XTestFakeButtonEvent(d, b, down, CurrentTime); XFlush(d); }
+
+static void xt_clicks(Display *d, unsigned int b, int n) {
+	for (int i = 0; i < n; i++) {
+		XTestFakeButtonEvent(d, b, 1, CurrentTime);
+		XTestFakeButtonEvent(d, b, 0, CurrentTime);
+	}
+	XFlush(d);
+}
 
 static int xt_key(Display *d, unsigned long sym, int down) {
 	KeyCode kc = XKeysymToKeycode(d, sym);
@@ -51,7 +55,12 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/kevmo314/urdp/internal/xlib"
 )
+
+// The X server auto-repeats held XTest keys itself.
+const hostAutoRepeats = true
 
 type xtest struct {
 	mu sync.Mutex
@@ -60,6 +69,7 @@ type xtest struct {
 
 // New returns an XTest-based injector for the X display in $DISPLAY.
 func New() (Injector, error) {
+	xlib.Init()
 	d := C.xt_open()
 	if d == nil {
 		return nil, errors.New("xtest: cannot open display or XTEST unavailable")
@@ -85,21 +95,15 @@ func (x *xtest) MouseButton(b int, down bool) error {
 func (x *xtest) Wheel(dx, dy int) error {
 	x.mu.Lock()
 	defer x.mu.Unlock()
-	click := func(b C.uint, n int) {
-		for range n {
-			C.xt_button(x.d, b, 1)
-			C.xt_button(x.d, b, 0)
-		}
-	}
 	if dy > 0 {
-		click(5, dy)
+		C.xt_clicks(x.d, 5, C.int(dy))
 	} else {
-		click(4, -dy)
+		C.xt_clicks(x.d, 4, C.int(-dy))
 	}
 	if dx > 0 {
-		click(7, dx)
+		C.xt_clicks(x.d, 7, C.int(dx))
 	} else {
-		click(6, -dx)
+		C.xt_clicks(x.d, 6, C.int(-dx))
 	}
 	return nil
 }

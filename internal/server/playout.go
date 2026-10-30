@@ -1,6 +1,8 @@
 package server
 
 import (
+	"slices"
+
 	"github.com/pion/interceptor"
 	"github.com/pion/rtp"
 )
@@ -32,9 +34,13 @@ func (p *playoutDelay) BindLocalStream(info *interceptor.StreamInfo, w intercept
 	}
 	zero := []byte{0, 0, 0}
 	return interceptor.RTPWriterFunc(func(h *rtp.Header, payload []byte, a interceptor.Attributes) (int, error) {
-		if err := h.SetExtension(uint8(id), zero); err != nil {
+		// The header is shared by every viewer of a track, and each viewer
+		// may have negotiated a different extension id; modify a copy.
+		hdr := *h
+		hdr.Extensions = slices.Clone(h.Extensions)
+		if err := hdr.SetExtension(uint8(id), zero); err != nil {
 			return 0, err
 		}
-		return w.Write(h, payload, a)
+		return w.Write(&hdr, payload, a)
 	})
 }

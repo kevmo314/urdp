@@ -15,14 +15,6 @@ package capture
 #include <stdlib.h>
 #include <string.h>
 
-static int ignore_errors(Display *d, XErrorEvent *e) { return 0; }
-
-static void urdp_init(void) {
-	XInitThreads();
-	// BadWindow/BadMatch from windows vanishing mid-capture must not abort.
-	XSetErrorHandler(ignore_errors);
-}
-
 typedef struct {
 	Display *dpy;
 	Drawable target;
@@ -52,6 +44,7 @@ static int grabber_alloc_image(grabber *g, Visual *vis, int depth, int w, int h)
 	g->shm.shmaddr = g->img->data = shmat(g->shm.shmid, NULL, 0);
 	// Mark for deletion now; it is freed once both sides detach.
 	shmctl(g->shm.shmid, IPC_RMID, NULL);
+	if (g->shm.shmaddr == (char *)-1) { g->img->data = NULL; XDestroyImage(g->img); g->img = NULL; return -1; }
 	g->shm.readOnly = False;
 	if (!XShmAttach(g->dpy, &g->shm)) { shmdt(g->shm.shmaddr); XDestroyImage(g->img); g->img = NULL; return -1; }
 	XSync(g->dpy, False);
@@ -64,6 +57,7 @@ static grabber *grabber_open(unsigned long win) {
 	if (!dpy) return NULL;
 	if (!XShmQueryExtension(dpy)) { XCloseDisplay(dpy); return NULL; }
 	grabber *g = calloc(1, sizeof(grabber));
+	if (!g) { XCloseDisplay(dpy); return NULL; }
 	g->dpy = dpy;
 	g->win = win;
 	g->target = win ? win : DefaultRootWindow(dpy);
@@ -158,11 +152,13 @@ static int grabber_bpp(grabber *g) { return g->img->bits_per_pixel; }
 
 static Atom atom(Display *d, const char *n) { return XInternAtom(d, n, False); }
 
-// Fetches a window-list or string property. Caller XFree()s *out.
-static unsigned long get_prop(Display *d, Window w, Atom prop, Atom type, unsigned char **out) {
+// Fetches a property of the given type and format (8, 16 or 32), returning
+// its item count, or 0 if absent or mismatched. Caller XFree()s *out.
+static unsigned long get_prop(Display *d, Window w, Atom prop, Atom type, int format, unsigned char **out) {
 	Atom actual; int fmt; unsigned long n, after;
 	*out = NULL;
 	if (XGetWindowProperty(d, w, prop, 0, 1 << 20, False, type, &actual, &fmt, &n, &after, out) != Success) return 0;
+	if (actual != type || fmt != format) return 0;
 	return n;
 }
 
@@ -173,9 +169,11 @@ static Display *list_dpy(void) { return XOpenDisplay(NULL); }
 static unsigned long list_windows(Display *d, Window **out) {
 	Window root = DefaultRootWindow(d);
 	unsigned char *data;
-	unsigned long n = get_prop(d, root, atom(d, "_NET_CLIENT_LIST"), XA_WINDOW, &data);
+	unsigned long n = get_prop(d, root, atom(d, "_NET_CLIENT_LIST"), XA_WINDOW, 32, &data);
 	if (n > 0) {
+		// Format-32 properties are returned as arrays of long.
 		*out = malloc(n * sizeof(Window));
+		if (!*out) { XFree(data); return 0; }
 		for (unsigned long i = 0; i < n; i++) (*out)[i] = ((unsigned long *)data)[i];
 		XFree(data);
 		return n;
@@ -184,6 +182,7 @@ static unsigned long list_windows(Display *d, Window **out) {
 	Window r, p, *kids; unsigned int nk;
 	if (!XQueryTree(d, root, &r, &p, &kids, &nk)) return 0;
 	*out = malloc((nk ? nk : 1) * sizeof(Window));
+	if (!*out) { if (kids) XFree(kids); return 0; }
 	unsigned long m = 0;
 	for (unsigned int i = 0; i < nk; i++) {
 		XWindowAttributes a;
@@ -196,7 +195,7 @@ static unsigned long list_windows(Display *d, Window **out) {
 
 static char *window_title(Display *d, Window w) {
 	unsigned char *data;
-	if (get_prop(d, w, atom(d, "_NET_WM_NAME"), atom(d, "UTF8_STRING"), &data) > 0) return (char *)data;
+	if (get_prop(d, w, atom(d, "_NET_WM_NAME"), atom(d, "UTF8_STRING"), 8, &data) > 0) return (char *)data;
 	if (data) XFree(data);
 	char *name = NULL;
 	if (XFetchName(d, w, &name) && name) return name;
@@ -219,11 +218,9 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/kevmo314/urdp/internal/xlib"
 )
-
-var initOnce sync.Once
-
-func xinit() { initOnce.Do(func() { C.urdp_init() }) }
 
 type x11Source struct {
 	mu    sync.Mutex
@@ -234,7 +231,7 @@ type x11Source struct {
 }
 
 func openX11(win uint64) (Source, error) {
-	xinit()
+	xlib.Init()
 	g := C.grabber_open(C.ulong(win))
 	if g == nil {
 		return nil, errors.New("x11: cannot open display or MIT-SHM unavailable (is DISPLAY set?)")
@@ -301,7 +298,7 @@ func (s *x11Source) Close() error {
 }
 
 func listWindows() ([]Window, error) {
-	xinit()
+	xlib.Init()
 	d := C.list_dpy()
 	if d == nil {
 		return nil, errors.New("x11: cannot open display")

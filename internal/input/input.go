@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"image"
+	"math"
 )
 
 // Event is the wire format sent by the browser over the data channels.
@@ -14,6 +15,7 @@ import (
 //	{"t":"u","b":0,"x":..,"y":..}        mouse button up
 //	{"t":"w","dx":0,"dy":-120}           wheel (browser deltaX/deltaY in pixels)
 //	{"t":"kd","c":"KeyA"}                key down (KeyboardEvent.code)
+//	{"t":"kd","c":"KeyA","r":true}       auto-repeat of a held key
 //	{"t":"ku","c":"KeyA"}                key up
 type Event struct {
 	Type string  `json:"t"`
@@ -23,6 +25,9 @@ type Event struct {
 	DX   float64 `json:"dx,omitempty"`
 	DY   float64 `json:"dy,omitempty"`
 	Code string  `json:"c,omitempty"`
+	// Repeat marks browser auto-repeat keydowns. They're dropped on hosts
+	// that auto-repeat held keys themselves.
+	Repeat bool `json:"r,omitempty"`
 }
 
 // Button identifiers, matching MouseEvent.button.
@@ -98,12 +103,20 @@ func (d *Dispatcher) Apply(e Event) error {
 	case "w":
 		// Browsers report ~100-120px per notch; accumulate fractional
 		// scrolling (trackpads) until a full notch is reached.
-		const notch = 100.0
+		const notch, maxNotches = 100.0, 20
+		if math.IsNaN(e.DX+e.DY) || math.IsInf(e.DX+e.DY, 0) {
+			return nil
+		}
 		d.wheelX += e.DX
 		d.wheelY += e.DY
 		nx, ny := int(d.wheelX/notch), int(d.wheelY/notch)
 		d.wheelX -= float64(nx) * notch
 		d.wheelY -= float64(ny) * notch
+		// Bound the work one message can cause.
+		if nx < -maxNotches || nx > maxNotches || ny < -maxNotches || ny > maxNotches {
+			nx, ny = max(min(nx, maxNotches), -maxNotches), max(min(ny, maxNotches), -maxNotches)
+			d.wheelX, d.wheelY = 0, 0
+		}
 		if nx == 0 && ny == 0 {
 			return nil
 		}
@@ -114,6 +127,9 @@ func (d *Dispatcher) Apply(e Event) error {
 			return nil
 		}
 		down := e.Type == "kd"
+		if down && e.Repeat && hostAutoRepeats {
+			return nil
+		}
 		d.pressed[e.Code] = down
 		return d.Inj.Key(k, down)
 	case "reset":

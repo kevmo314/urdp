@@ -80,6 +80,9 @@ var dpiOnce sync.Once
 
 type windowsInjector struct{}
 
+// Windows doesn't auto-repeat injected keys; forward the browser's repeats.
+const hostAutoRepeats = false
+
 func New() (Injector, error) {
 	dpiOnce.Do(func() { C.input_dpi() })
 	return &windowsInjector{}, nil

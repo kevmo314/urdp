@@ -11,7 +11,8 @@ import (
 )
 
 // startAudio captures system audio for the lifetime of the process and
-// writes Opus packets to a track shared by all viewers.
+// writes Opus packets to a track shared by all viewers. If the device
+// fails (e.g. the default output changes) it is reopened.
 func startAudio(open func() (audio.Source, error), bitrate int) (*webrtc.TrackLocalStaticSample, error) {
 	src, err := open()
 	if err != nil {
@@ -31,22 +32,34 @@ func startAudio(open func() (audio.Source, error), bitrate int) (*webrtc.TrackLo
 		return nil, err
 	}
 	go func() {
-		defer src.Close()
 		defer enc.Close()
 		pcm := make([]int16, audio.FrameSamples*audio.Channels)
 		pkt := make([]byte, 1500)
 		for {
-			if err := src.Read(pcm); err != nil {
-				log.Printf("audio: %v", err)
-				return
+			err := pump(src, enc, track, pcm, pkt)
+			src.Close()
+			log.Printf("audio: %v; reopening", err)
+			for {
+				time.Sleep(time.Second)
+				if src, err = open(); err == nil {
+					break
+				}
 			}
-			n, err := enc.Encode(pcm, pkt)
-			if err != nil {
-				log.Printf("audio: %v", err)
-				continue
-			}
-			_ = track.WriteSample(media.Sample{Data: pkt[:n], Duration: audio.FrameMs * time.Millisecond})
 		}
 	}()
 	return track, nil
+}
+
+// pump encodes and sends audio until src fails.
+func pump(src audio.Source, enc *audio.OpusEncoder, track *webrtc.TrackLocalStaticSample, pcm []int16, pkt []byte) error {
+	for {
+		if err := src.Read(pcm); err != nil {
+			return err
+		}
+		n, err := enc.Encode(pcm, pkt)
+		if err != nil {
+			return err
+		}
+		_ = track.WriteSample(media.Sample{Data: pkt[:n], Duration: audio.FrameMs * time.Millisecond})
+	}
 }

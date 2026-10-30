@@ -10,8 +10,10 @@ static pa_simple *pa_open(int rate, int channels, int frag_bytes, int *err) {
 	pa_sample_spec ss = { .format = PA_SAMPLE_S16LE, .rate = rate, .channels = channels };
 	// A small fragsize is what makes the server deliver audio promptly
 	// instead of batching ~2s of samples.
+	// maxlength bounds how much audio queues up if we fall behind; older
+	// samples are dropped rather than played late.
 	pa_buffer_attr attr = {
-		.maxlength = (uint32_t)-1, .tlength = (uint32_t)-1,
+		.maxlength = frag_bytes * 8, .tlength = (uint32_t)-1,
 		.prebuf = (uint32_t)-1, .minreq = (uint32_t)-1,
 		.fragsize = frag_bytes,
 	};

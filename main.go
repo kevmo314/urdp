@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/pion/webrtc/v4"
 
@@ -29,10 +30,11 @@ func main() {
 		addr      = flag.String("addr", ":8000", "HTTP listen address")
 		fps       = flag.Int("fps", 60, "capture/encode frame rate")
 		bitrate   = flag.Int("bitrate", 20000, "maximum video bitrate in kbps")
-		keyint    = flag.Int("keyint", 5, "seconds between periodic keyframes")
+		keyint    = flag.Int("keyint", 30, "seconds between periodic keyframes (they're also sent whenever a viewer reports loss)")
 		audioKbps = flag.Int("audio", 128, "Opus bitrate in kbps (0 disables audio)")
 		stun      = flag.String("stun", "", "comma-separated STUN/TURN URLs, e.g. stun:stun.l.google.com:19302")
 		nat1to1   = flag.String("nat1to1", "", "comma-separated public IPs to advertise as host candidates")
+		hosts     = flag.String("hosts", "", "comma-separated hostnames clients may use to reach the server (IPs and localhost are always allowed)")
 		list      = flag.Bool("list", false, "list capturable windows and exit")
 		password  = flag.String("password", os.Getenv("URDP_PASSWORD"), "require this password (HTTP basic auth, any username); defaults to $URDP_PASSWORD")
 	)
@@ -61,6 +63,9 @@ func main() {
 	if *stun != "" {
 		cfg.ICEServers = []webrtc.ICEServer{{URLs: strings.Split(*stun, ",")}}
 	}
+	if *hosts != "" {
+		cfg.AllowedHosts = strings.Split(strings.ToLower(*hosts), ",")
+	}
 	if *nat1to1 != "" {
 		cfg.NAT1To1IPs = strings.Split(*nat1to1, ",")
 	}
@@ -80,7 +85,8 @@ func main() {
 	} else {
 		log.Printf("warning: no -password set; anyone who can reach this port controls this machine")
 	}
-	log.Fatal(http.Serve(ln, h))
+	hs := &http.Server{Handler: h, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 2 * time.Minute}
+	log.Fatal(hs.Serve(ln))
 }
 
 func basicAuth(next http.Handler, password string) http.Handler {

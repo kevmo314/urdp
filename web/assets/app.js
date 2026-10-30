@@ -18,7 +18,16 @@ function toast(msg) {
 }
 
 async function connect() {
-  pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+  const conn = pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+  try {
+    await negotiate(conn);
+  } catch (e) {
+    conn.close();
+    throw e;
+  }
+}
+
+async function negotiate(pc) {
   pc.addTransceiver('video', { direction: 'recvonly' });
   pc.addTransceiver('audio', { direction: 'recvonly' });
   input = pc.createDataChannel('input', { ordered: true });
@@ -41,8 +50,14 @@ async function connect() {
     const s = pc.connectionState;
     if (s === 'connected') toast('');
     else if (s === 'failed' || s === 'disconnected') toast(`Connection ${s} — reconnecting…`);
-    if (s === 'failed') setTimeout(reconnect, 1000);
+    // "disconnected" often heals by itself; give it a moment.
+    if (s === 'failed' || s === 'disconnected') {
+      setTimeout(() => {
+        if (pc === window.urdpPC && ['failed', 'disconnected'].includes(pc.connectionState)) reconnect();
+      }, s === 'failed' ? 500 : 4000);
+    }
   };
+  window.urdpPC = pc;
 
   await pc.setLocalDescription(await pc.createOffer());
   await gatheringComplete(pc);
@@ -68,6 +83,7 @@ function gatheringComplete(pc) {
 
 async function reconnect() {
   pc?.close();
+  prev = undefined;
   try { await connect(); } catch (e) { toast(`Error: ${e.message}`); setTimeout(reconnect, 2000); }
 }
 
@@ -89,20 +105,25 @@ function norm(e) {
 }
 
 video.addEventListener('pointermove', (e) => {
-  // Coalesced events would be sent as separate positions; only the latest
-  // matters for an absolute pointer.
+  // Only the latest position matters for an absolute pointer, so skip
+  // this one rather than queue it behind others on a congested link.
+  if (move?.bufferedAmount > 0) return;
   send(move, { t: 'm', ...norm(e) });
 });
-video.addEventListener('pointerdown', (e) => {
+// Capture keeps moves (and the final release) flowing while dragging
+// outside the video.
+video.addEventListener('pointerdown', (e) => video.setPointerCapture(e.pointerId));
+// mousedown/up rather than pointerdown/up: pointer events only fire for
+// the first press and last release, losing chorded buttons.
+video.addEventListener('mousedown', (e) => {
   video.focus();
-  video.setPointerCapture(e.pointerId);
   send(input, { t: 'd', b: e.button, ...norm(e) });
   e.preventDefault();
 });
-video.addEventListener('pointerup', (e) => {
-  send(input, { t: 'u', b: e.button, ...norm(e) });
-  e.preventDefault();
+window.addEventListener('mouseup', (e) => {
+  if (gate.hidden) send(input, { t: 'u', b: e.button, ...norm(e) });
 });
+video.addEventListener('pointercancel', () => send(input, { t: 'reset' }));
 video.addEventListener('contextmenu', (e) => e.preventDefault());
 video.addEventListener('wheel', (e) => {
   const k = e.deltaMode === 1 ? 40 : e.deltaMode === 2 ? 800 : 1;
@@ -112,7 +133,7 @@ video.addEventListener('wheel', (e) => {
 
 window.addEventListener('keydown', (e) => {
   if (!gate.hidden || e.code === 'F11') return;
-  send(input, { t: 'kd', c: e.code });
+  send(input, e.repeat ? { t: 'kd', c: e.code, r: true } : { t: 'kd', c: e.code });
   e.preventDefault();
 });
 window.addEventListener('keyup', (e) => {

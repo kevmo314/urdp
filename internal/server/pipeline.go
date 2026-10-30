@@ -3,13 +3,15 @@ package server
 import (
 	"errors"
 	"log"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/rtp"
+	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
-	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
@@ -20,7 +22,7 @@ import (
 type pipeline struct {
 	id    string
 	src   capture.Source
-	track *webrtc.TrackLocalStaticSample
+	track *webrtc.TrackLocalStaticRTP
 	opts  encoder.Options
 
 	keyframe atomic.Bool
@@ -92,7 +94,7 @@ type pipelineStats struct {
 }
 
 func newPipeline(id string, src capture.Source, opts encoder.Options) (*pipeline, error) {
-	track, err := webrtc.NewTrackLocalStaticSample(
+	track, err := webrtc.NewTrackLocalStaticRTP(
 		webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeH264},
 		"video", "urdp-"+id)
 	if err != nil {
@@ -122,37 +124,47 @@ func (p *pipeline) run() {
 	timer := time.NewTimer(0)
 	defer timer.Stop()
 	start := time.Now()
-	last := start
 	kbps := p.opts.BitrateKbps
 	var nextRate time.Time
 	var sentBytes int // since nextRate was last set
 
+	// Packetize here rather than via TrackLocalStaticSample so each frame
+	// carries its own capture time as RTP timestamp. (The sample track
+	// advances the timestamp after a frame, which shifts idle gaps onto
+	// the wrong frame and inflates the receiver's jitter estimate.)
+	packetizer := rtp.NewPacketizer(1200, 0, 0, &codecs.H264Payloader{}, rtp.NewRandomSequencer(), 90000)
+	tsBase := rand.Uint32()
+
 	for {
-		// Pace to the frame-rate cap. Sources that block in Capture until
-		// the screen updates hand frames over the moment they're presented,
-		// so this only throttles, it never adds a fixed polling delay.
 		select {
 		case <-p.stop:
 			return
 		case <-timer.C:
 		}
-		t0 := time.Now()
-		timer.Reset(interval)
 
+		// Sources that block in Capture until the screen updates hand
+		// frames over the moment they're presented; the timer below only
+		// enforces the frame-rate cap after a frame has been produced.
+		captureStart := time.Now()
 		f, changed, err := p.src.Capture(interval)
+		t0 := time.Now()
 		if errors.Is(err, capture.ErrNotFound) {
 			log.Printf("source %s: window gone", p.id)
 			return
 		}
 		if err != nil {
 			log.Printf("source %s: capture: %v", p.id, err)
+			timer.Reset(interval)
 			continue
 		}
 		// Nothing new on screen: send nothing rather than re-encode an
 		// identical picture, unless a viewer needs a keyframe.
 		if !changed && !p.keyframe.Load() {
+			timer.Reset(0)
 			continue
 		}
+		// Space capture starts at least one interval apart.
+		timer.Reset(interval - time.Since(captureStart))
 		t1 := time.Now()
 
 		if enc != nil {
@@ -192,16 +204,20 @@ func (p *pipeline) run() {
 			continue
 		}
 		sentBytes += len(data)
-		if err := p.track.WriteSample(media.Sample{Data: data, Duration: t0.Sub(last)}); err != nil {
-			log.Printf("source %s: write: %v", p.id, err)
+		ts := tsBase + uint32(t0.Sub(start)*90000/time.Second)
+		for _, pkt := range packetizer.Packetize(data, 0) {
+			pkt.Timestamp = ts
+			if err := p.track.WriteRTP(pkt); err != nil {
+				log.Printf("source %s: write: %v", p.id, err)
+				break
+			}
 		}
-		last = t0
 
 		ew, eh := enc.Size()
 		p.statsMu.Lock()
 		p.stats = pipelineStats{
 			Width: ew, Height: eh,
-			CaptureMs:   float64(t1.Sub(t0).Microseconds()) / 1000,
+			CaptureMs:   float64(t0.Sub(captureStart).Microseconds()) / 1000, // includes waiting for an update
 			EncodeMs:    float64(t2.Sub(t1).Microseconds()) / 1000,
 			Bytes:       len(data),
 			BitrateKbps: kbps,

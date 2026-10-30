@@ -9,8 +9,10 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -33,6 +35,9 @@ type Config struct {
 	AudioKbps int
 	// ICEServers are passed to the peer connection (e.g. STUN for NAT).
 	ICEServers []webrtc.ICEServer
+	// AllowedHosts are hostnames (besides IPs and localhost) the server may
+	// be reached by, e.g. "desktop.example.com". See allowedRequest.
+	AllowedHosts []string
 	// NAT1To1IPs advertises these IPs as host candidates, for hosts
 	// behind 1:1 NAT (e.g. WSL2, containers).
 	NAT1To1IPs []string
@@ -98,7 +103,32 @@ func New(cfg Config) (*Server, error) {
 	return s, nil
 }
 
-func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
+func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if !s.allowedRequest(r) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+		return
+	}
+	s.mux.ServeHTTP(w, r)
+}
+
+// allowedRequest blocks other websites from driving the API through the
+// viewer's browser: cross-site requests (CSRF) and DNS rebinding, where an
+// attacker's hostname resolves to this server. Hosts must be an IP
+// literal, localhost, or listed in Config.AllowedHosts.
+func (s *Server) allowedRequest(r *http.Request) bool {
+	if site := r.Header.Get("Sec-Fetch-Site"); site == "cross-site" || site == "same-site" {
+		return false
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(host, "[]")
+	if net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") {
+		return true
+	}
+	return slices.Contains(s.cfg.AllowedHosts, strings.ToLower(host))
+}
 
 // newAPI builds a WebRTC API for one peer connection. It's per connection
 // so the congestion controller's bandwidth estimator can be tied to it.
@@ -263,7 +293,16 @@ func (s *Server) audio() *webrtc.TrackLocalStaticSample {
 	return s.audioTrack
 }
 
+// connectTimeout bounds how long an answered offer may take to connect.
+const connectTimeout = 15 * time.Second
+
 func (s *Server) handleOffer(w http.ResponseWriter, r *http.Request) {
+	// Requiring JSON forces a CORS preflight for cross-origin callers,
+	// which we never approve.
+	if ct, _, _ := strings.Cut(r.Header.Get("Content-Type"), ";"); ct != "application/json" {
+		http.Error(w, "Content-Type must be application/json", http.StatusUnsupportedMediaType)
+		return
+	}
 	var offer webrtc.SessionDescription
 	if err := json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&offer); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -300,9 +339,11 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 		return nil, err
 	}
 	sess := &session{p: p, pc: pc}
+	closed := make(chan struct{})
 	var closeOnce sync.Once
 	cleanup := func() {
 		closeOnce.Do(func() {
+			close(closed)
 			p.removeViewer(sess)
 			s.release(p)
 			_ = pc.Close()
@@ -333,17 +374,36 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		log.Printf("peer %p source %q: %s", pc, id, st)
 		switch st {
+		case webrtc.PeerConnectionStateConnected:
+			// Only now can this viewer receive anything; an IDR sent
+			// earlier was dropped, and a static screen sends nothing else.
+			p.keyframe.Store(true)
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			sess.release()
 			cleanup()
 		}
 	})
 	go func() {
-		// Tear down viewers when the source disappears (window closed).
-		<-p.done
-		sess.send(`{"t":"ended"}`)
-		time.Sleep(100 * time.Millisecond)
-		cleanup()
+		connectBy := time.NewTimer(connectTimeout)
+		defer connectBy.Stop()
+		for {
+			select {
+			case <-closed:
+				return
+			case <-p.done:
+				// The source disappeared (window closed).
+				sess.send(`{"t":"ended"}`)
+				time.Sleep(100 * time.Millisecond)
+				cleanup()
+				return
+			case <-connectBy.C:
+				// Don't hold a pipeline open for offers that never connect.
+				if pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
+					cleanup()
+					return
+				}
+			}
+		}
 	}()
 
 	if err := pc.SetRemoteDescription(offer); err != nil {

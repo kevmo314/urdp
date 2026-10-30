@@ -35,6 +35,10 @@ static void bgra_to_i420(const uint8_t *restrict src, int stride, int w, int h,
 	}
 }
 
+// A 100ms VBV buffer bounds how big a burst (e.g. a keyframe) can be, and
+// so how long it occupies the link, at some cost to keyframe quality.
+static int vbv_buffer(int kbps) { return kbps / 10; }
+
 typedef struct {
 	x264_t *h;
 	x264_picture_t in, out;
@@ -51,6 +55,10 @@ static enc *enc_open(int w, int h, int fps, int kbps, int keyint, int threads) {
 	p.i_fps_den = 1;
 	p.i_timebase_num = 1;
 	p.i_timebase_den = 1000;
+	// VFR rate control would hold each frame until the next one arrives
+	// to learn its duration: a frame of latency, or worse, since frames are
+	// only produced when the screen changes. CFR just under-credits VBV
+	// refill across idle gaps, which errs on the safe side.
 	p.b_vfr_input = 0;
 	p.i_threads = threads;
 	p.i_keyint_max = keyint;
@@ -62,7 +70,7 @@ static enc *enc_open(int w, int h, int fps, int kbps, int keyint, int threads) {
 	p.rc.i_rc_method = X264_RC_CRF;
 	p.rc.f_rf_constant = 23;
 	p.rc.i_vbv_max_bitrate = kbps;
-	p.rc.i_vbv_buffer_size = kbps / 4;
+	p.rc.i_vbv_buffer_size = vbv_buffer(kbps);
 	p.vui.b_fullrange = 0;
 	p.vui.i_colorprim = 1;
 	p.vui.i_transfer = 1;
@@ -107,7 +115,7 @@ static int enc_set_bitrate(enc *e, int kbps) {
 	x264_param_t p;
 	x264_encoder_parameters(e->h, &p);
 	p.rc.i_vbv_max_bitrate = kbps;
-	p.rc.i_vbv_buffer_size = kbps / 4;
+	p.rc.i_vbv_buffer_size = vbv_buffer(kbps);
 	return x264_encoder_reconfig(e->h, &p);
 }
 

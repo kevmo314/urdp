@@ -70,3 +70,16 @@ func TestKeymapScancodesUnique(t *testing.T) {
 		seen[k.Scan] = code
 	}
 }
+
+func TestWheelClamped(t *testing.T) {
+	rec := &recorder{}
+	d := &Dispatcher{Inj: rec, Bounds: func() image.Rectangle { return image.Rect(0, 0, 10, 10) }}
+	for _, m := range []string{`{"t":"w","dy":1e15}`, `{"t":"w","dy":-1e300}`} {
+		if err := d.Handle([]byte(m)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if want := []string{"wheel 0,20", "wheel 0,-20"}; !slices.Equal(rec.calls, want) {
+		t.Errorf("calls %q, want %q", rec.calls, want)
+	}
+}
