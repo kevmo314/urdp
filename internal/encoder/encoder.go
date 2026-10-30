@@ -13,24 +13,24 @@ package encoder
 #include <x264.h>
 
 // BT.709 limited range, 8-bit fixed point. Chroma is the 2x2 average.
-static void bgra_to_i420(const uint8_t *src, int stride, int w, int h,
-		uint8_t *y, int ys, uint8_t *u, int us, uint8_t *v, int vs) {
+// Written as simple per-row loops so the compiler auto-vectorizes them.
+static void bgra_to_i420(const uint8_t *restrict src, int stride, int w, int h,
+		uint8_t *restrict y, int ys, uint8_t *restrict u, int us, uint8_t *restrict v, int vs) {
+	for (int j = 0; j < h; j++) {
+		const uint8_t *s = src + (size_t)j * stride;
+		uint8_t *d = y + (size_t)j * ys;
+		for (int i = 0; i < w; i++)
+			d[i] = (uint8_t)(((47 * s[4 * i + 2] + 157 * s[4 * i + 1] + 16 * s[4 * i] + 128) >> 8) + 16);
+	}
 	for (int j = 0; j < h; j += 2) {
-		const uint8_t *r0 = src + (size_t)j * stride, *r1 = r0 + stride;
-		uint8_t *y0 = y + (size_t)j * ys, *y1 = y0 + ys;
-		uint8_t *uu = u + (size_t)(j / 2) * us, *vv = v + (size_t)(j / 2) * vs;
-		for (int i = 0; i < w; i += 2) {
-			const uint8_t *p[4] = { r0 + i * 4, r0 + i * 4 + 4, r1 + i * 4, r1 + i * 4 + 4 };
-			int sb = 0, sg = 0, sr = 0;
-			for (int k = 0; k < 4; k++) {
-				int b = p[k][0], g = p[k][1], r = p[k][2];
-				sb += b; sg += g; sr += r;
-				uint8_t yv = (uint8_t)(((47 * r + 157 * g + 16 * b + 128) >> 8) + 16);
-				if (k == 0) y0[i] = yv; else if (k == 1) y0[i + 1] = yv;
-				else if (k == 2) y1[i] = yv; else y1[i + 1] = yv;
-			}
-			uu[i / 2] = (uint8_t)(((-26 * sr - 87 * sg + 112 * sb + 512) >> 10) + 128);
-			vv[i / 2] = (uint8_t)(((112 * sr - 102 * sg - 10 * sb + 512) >> 10) + 128);
+		const uint8_t *s0 = src + (size_t)j * stride, *s1 = s0 + stride;
+		uint8_t *du = u + (size_t)(j / 2) * us, *dv = v + (size_t)(j / 2) * vs;
+		for (int i = 0; i < w / 2; i++) {
+			int b = s0[8 * i] + s0[8 * i + 4] + s1[8 * i] + s1[8 * i + 4];
+			int g = s0[8 * i + 1] + s0[8 * i + 5] + s1[8 * i + 1] + s1[8 * i + 5];
+			int r = s0[8 * i + 2] + s0[8 * i + 6] + s1[8 * i + 2] + s1[8 * i + 6];
+			du[i] = (uint8_t)(((-26 * r - 86 * g + 112 * b + 512) >> 10) + 128);
+			dv[i] = (uint8_t)(((112 * r - 102 * g - 10 * b + 512) >> 10) + 128);
 		}
 	}
 }
@@ -81,11 +81,16 @@ static void enc_close(enc *e) {
 	free(e);
 }
 
-static void enc_convert(enc *e, const uint8_t *src, int stride, int w, int h) {
+// Converts rows [j0, j1) of src; j0 and j1 must be even.
+static void enc_convert(enc *e, const uint8_t *src, int stride, int w, int j0, int j1) {
 	x264_image_t *im = &e->in.img;
-	bgra_to_i420(src, stride, w, h, im->plane[0], im->i_stride[0],
-		im->plane[1], im->i_stride[1], im->plane[2], im->i_stride[2]);
+	bgra_to_i420(src + (size_t)j0 * stride, stride, w, j1 - j0,
+		im->plane[0] + (size_t)j0 * im->i_stride[0], im->i_stride[0],
+		im->plane[1] + (size_t)(j0 / 2) * im->i_stride[1], im->i_stride[1],
+		im->plane[2] + (size_t)(j0 / 2) * im->i_stride[2], im->i_stride[2]);
 }
+
+static uint8_t *enc_plane(enc *e, int i, int *stride) { *stride = e->in.img.i_stride[i]; return e->in.img.plane[i]; }
 
 // Returns encoded byte count (Annex B, all NALs contiguous) or <0 on error.
 static int enc_encode(enc *e, int64_t pts_ms, int idr, uint8_t **out) {
@@ -105,6 +110,7 @@ import "C"
 import (
 	"errors"
 	"runtime"
+	"sync"
 	"unsafe"
 
 	"github.com/kevmo314/urdp/internal/capture"
@@ -161,7 +167,7 @@ func (e *Encoder) Encode(f *capture.Frame, ptsMs int64, keyframe bool) ([]byte, 
 	if f.Width < e.w || f.Height < e.h {
 		return nil, false, errors.New("encoder: frame smaller than encoder")
 	}
-	C.enc_convert(e.e, (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(f.Pix))), C.int(f.Stride), C.int(e.w), C.int(e.h))
+	e.convert(f)
 	var out *C.uint8_t
 	n := C.enc_encode(e.e, C.int64_t(ptsMs), cbool(keyframe), &out)
 	if n < 0 {
@@ -172,6 +178,34 @@ func (e *Encoder) Encode(f *capture.Frame, ptsMs int64, keyframe bool) ([]byte, 
 	}
 	e.buf = append(e.buf[:0], unsafe.Slice((*byte)(unsafe.Pointer(out)), int(n))...)
 	return e.buf, C.enc_last_idr(e.e) != 0, nil
+}
+
+// convert fills the encoder's input picture from f, splitting the rows
+// across goroutines; it's memory bound, so a few bands are enough.
+func (e *Encoder) convert(f *capture.Frame) {
+	src := (*C.uint8_t)(unsafe.Pointer(unsafe.SliceData(f.Pix)))
+	bands := min(4, runtime.NumCPU())
+	step := (e.h/bands + 1) &^ 1
+	var wg sync.WaitGroup
+	for j := 0; j < e.h; j += step {
+		wg.Add(1)
+		go func(j0, j1 int) {
+			defer wg.Done()
+			C.enc_convert(e.e, src, C.int(f.Stride), C.int(e.w), C.int(j0), C.int(j1))
+		}(j, min(j+step, e.h))
+	}
+	wg.Wait()
+}
+
+// plane exposes input picture plane i (0=Y, 1=U, 2=V) for tests.
+func (e *Encoder) plane(i int) ([]byte, int) {
+	var stride C.int
+	p := C.enc_plane(e.e, C.int(i), &stride)
+	rows := e.h
+	if i > 0 {
+		rows /= 2
+	}
+	return unsafe.Slice((*byte)(unsafe.Pointer(p)), int(stride)*rows), int(stride)
 }
 
 func (e *Encoder) Close() {

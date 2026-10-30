@@ -1,0 +1,17 @@
+#include <stdint.h>
+typedef struct capture_native capture_native;
+typedef struct {
+    int x, y, w, h;
+} capture_rect;
+typedef struct {
+    uint64_t id;
+    char title[8192];
+    int w, h;
+} capture_window;
+void capture_dpi(void);
+long capture_open(uint64_t hwnd, capture_native **out);
+long capture_bounds(capture_native *s, capture_rect *r);
+long capture_frame(capture_native *s, unsigned char *dst, unsigned int timeout_ms);
+void capture_close(capture_native *s);
+long capture_list(capture_window **out, int *count);
+void capture_free(void *p);

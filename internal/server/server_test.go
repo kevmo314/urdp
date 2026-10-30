@@ -46,9 +46,11 @@ func (f *fakeInjector) Close() error       { return nil }
 func newTestServer(t *testing.T, inj *fakeInjector) (*Server, *httptest.Server) {
 	t.Helper()
 	s, err := New(Config{
-		Encoder:     encoder.Options{FPS: 30},
-		OpenSource:  func(string) (capture.Source, error) { return capture.NewTestSource(320, 240), nil },
-		ListWindows: func() ([]capture.Window, error) { return []capture.Window{{ID: 0x1234, Title: "x", Width: 1, Height: 1}}, nil },
+		Encoder:    encoder.Options{FPS: 30},
+		OpenSource: func(string) (capture.Source, error) { return capture.NewTestSource(320, 240), nil },
+		ListWindows: func() ([]capture.Window, error) {
+			return []capture.Window{{ID: 0x1234, Title: "x", Width: 1, Height: 1}}, nil
+		},
 		NewInjector: func() (input.Injector, error) { return inj, nil },
 		OpenAudio:   func() (audio.Source, error) { return nil, errors.New("no audio in tests") },
 	})

@@ -65,26 +65,35 @@ func (p *pipeline) run() {
 	}()
 
 	interval := time.Second / time.Duration(p.opts.FPS)
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
 	start := time.Now()
 	last := start
 
 	for {
+		// Pace to the frame-rate cap. Sources that block in Capture until
+		// the screen updates hand frames over the moment they're presented,
+		// so this only throttles, it never adds a fixed polling delay.
 		select {
 		case <-p.stop:
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
-
 		t0 := time.Now()
-		f, err := p.src.Capture()
+		timer.Reset(interval)
+
+		f, changed, err := p.src.Capture(interval)
 		if errors.Is(err, capture.ErrNotFound) {
 			log.Printf("source %s: window gone", p.id)
 			return
 		}
 		if err != nil {
 			log.Printf("source %s: capture: %v", p.id, err)
+			continue
+		}
+		// Nothing new on screen: send nothing rather than re-encode an
+		// identical picture, unless a viewer needs a keyframe.
+		if !changed && !p.keyframe.Load() {
 			continue
 		}
 		t1 := time.Now()

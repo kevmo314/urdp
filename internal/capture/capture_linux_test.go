@@ -21,7 +21,7 @@ func TestDesktopCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	f, err := src.Capture()
+	f, _, err := src.Capture(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -64,7 +64,7 @@ func TestWindowCapture(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer src.Close()
-	f, err := src.Capture()
+	f, _, err := src.Capture(0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -78,7 +78,7 @@ func TestWindowCapture(t *testing.T) {
 	cmd.Process.Kill()
 	cmd.Wait()
 	time.Sleep(200 * time.Millisecond)
-	if _, err := src.Capture(); err != ErrNotFound {
+	if _, _, err := src.Capture(0); err != ErrNotFound {
 		t.Errorf("capture after close: %v, want ErrNotFound", err)
 	}
 }

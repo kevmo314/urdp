@@ -22,7 +22,7 @@ func NewTestSource(w, h int) *TestSource {
 	}
 }
 
-func (t *TestSource) Capture() (*Frame, error) {
+func (t *TestSource) Capture(time.Duration) (*Frame, bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	f := &t.frame
@@ -42,7 +42,7 @@ func (t *TestSource) Capture() (*Frame, error) {
 			p[3] = 255
 		}
 	}
-	return f, nil
+	return f, true, nil
 }
 
 func (t *TestSource) Bounds() image.Rectangle {

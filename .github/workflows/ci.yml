@@ -30,3 +30,29 @@ jobs:
         with:
           name: urdp-linux-amd64
           path: urdp
+
+  windows:
+    # Cross-compiled with mingw-w64 against static x264/Opus, producing a
+    # single self-contained urdp.exe.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y gcc-mingw-w64-x86-64 nasm pkg-config
+      - uses: actions/cache@v4
+        with:
+          path: third_party/windows
+          key: windows-deps-${{ hashFiles('scripts/build-windows-deps.sh') }}
+      - name: Build x264 and Opus
+        run: scripts/build-windows-deps.sh
+      - name: Vet
+        run: make vet-windows
+      - name: Build
+        run: make windows
+      - uses: actions/upload-artifact@v4
+        with:
+          name: urdp-windows-amd64
+          path: bin/urdp.exe

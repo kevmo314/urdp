@@ -165,6 +165,7 @@ import (
 	"fmt"
 	"image"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -187,7 +188,7 @@ func openX11(win uint64) (Source, error) {
 		return nil, errors.New("x11: cannot open display or MIT-SHM unavailable (is DISPLAY set?)")
 	}
 	s := &x11Source{g: g, win: win}
-	if _, err := s.Capture(); err != nil {
+	if _, _, err := s.Capture(0); err != nil {
 		C.grabber_close(g)
 		return nil, err
 	}
@@ -197,17 +198,17 @@ func openX11(win uint64) (Source, error) {
 func openDesktop() (Source, error)         { return openX11(0) }
 func openWindow(id uint64) (Source, error) { return openX11(id) }
 
-func (s *x11Source) Capture() (*Frame, error) {
+func (s *x11Source) Capture(time.Duration) (*Frame, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	switch C.grabber_grab(s.g) {
 	case -2:
-		return nil, ErrNotFound
+		return nil, false, ErrNotFound
 	case -1:
-		return nil, errors.New("x11: XShmGetImage failed")
+		return nil, false, errors.New("x11: XShmGetImage failed")
 	}
 	if bpp := C.grabber_bpp(s.g); bpp != 32 {
-		return nil, fmt.Errorf("x11: unsupported %d bits per pixel", bpp)
+		return nil, false, fmt.Errorf("x11: unsupported %d bits per pixel", bpp)
 	}
 	w, h, stride := int(s.g.w), int(s.g.h), int(C.grabber_stride(s.g))
 	s.frame = Frame{
@@ -218,7 +219,7 @@ func (s *x11Source) Capture() (*Frame, error) {
 	}
 	x, y := int(s.g.x), int(s.g.y)
 	s.rect = image.Rect(x, y, x+w, y+h)
-	return &s.frame, nil
+	return &s.frame, true, nil
 }
 
 func (s *x11Source) Bounds() image.Rectangle {

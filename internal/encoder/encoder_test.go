@@ -27,7 +27,7 @@ func TestEncodeKeyframes(t *testing.T) {
 	defer enc.Close()
 
 	for i := range 10 {
-		f, _ := src.Capture()
+		f, _, _ := src.Capture(0)
 		data, idr, err := enc.Encode(f, int64(i*33), i == 0 || i == 5)
 		if err != nil {
 			t.Fatal(err)
@@ -55,7 +55,7 @@ func TestOddDimensions(t *testing.T) {
 	if w, h := enc.Size(); w != 320 || h != 240 {
 		t.Fatalf("size = %dx%d, want 320x240", w, h)
 	}
-	f, _ := capture.NewTestSource(321, 241).Capture()
+	f, _, _ := capture.NewTestSource(321, 241).Capture(0)
 	if _, _, err := enc.Encode(f, 0, true); err != nil {
 		t.Fatal(err)
 	}
@@ -68,4 +68,26 @@ func contains(s []int, v int) bool {
 		}
 	}
 	return false
+}
+
+func TestConvertColors(t *testing.T) {
+	enc, err := New(64, 64, Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer enc.Close()
+	// Top half white, bottom half black, as BGRA.
+	f := &capture.Frame{Pix: make([]byte, 64*64*4), Stride: 64 * 4, Width: 64, Height: 64}
+	for i := 0; i < 32*64*4; i++ {
+		f.Pix[i] = 255
+	}
+	enc.convert(f)
+	y, ys := enc.plane(0)
+	u, us := enc.plane(1)
+	if y[0] != 235 || y[63*ys] != 16 {
+		t.Errorf("luma white=%d black=%d, want 235/16", y[0], y[63*ys])
+	}
+	if u[0] != 128 || u[31*us] != 128 {
+		t.Errorf("chroma white=%d black=%d, want 128", u[0], u[31*int(us)])
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"image"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Frame is a BGRA (little-endian 0xAARRGGBB) image. Pix is only valid until the
@@ -20,9 +21,11 @@ type Frame struct {
 
 // Source produces frames from the desktop or a single window.
 type Source interface {
-	// Capture returns the latest frame. It may return the previously
-	// captured frame if nothing has changed.
-	Capture() (*Frame, error)
+	// Capture returns the latest frame and whether it changed since the
+	// previous call. Sources that are notified of screen updates block up
+	// to wait for new content so frames are grabbed the moment they are
+	// presented; polling sources return immediately.
+	Capture(wait time.Duration) (f *Frame, changed bool, err error)
 	// Bounds is the screen-space rectangle covered by the last frame, used
 	// to map normalized input coordinates to absolute screen positions.
 	Bounds() image.Rectangle
