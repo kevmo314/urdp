@@ -26,6 +26,13 @@ jobs:
         run: xvfb-run -a -s "-screen 0 1280x720x24" go test -race ./...
       - name: Build
         run: go build -o urdp .
+      - name: End-to-end latency (Chrome)
+        run: |
+          Xvfb :99 -screen 0 1920x1080x24 &
+          sleep 1
+          DISPLAY=:99 ./urdp -addr 127.0.0.1:8000 -audio 0 &
+          sleep 1
+          DISPLAY=:99 node scripts/e2e.mjs 'http://localhost:8000/?probe' 12 250
       - uses: actions/upload-artifact@v4
         with:
           name: urdp-linux-amd64
