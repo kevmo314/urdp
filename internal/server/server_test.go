@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"image"
+	"image/png"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -15,11 +16,13 @@ import (
 
 	"github.com/pion/rtp/codecs"
 	"github.com/pion/webrtc/v4"
+	"github.com/pion/webrtc/v4/pkg/media"
 
 	"github.com/kevmo314/urdp/internal/audio"
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
 	"github.com/kevmo314/urdp/internal/input"
+	"github.com/kevmo314/urdp/internal/vdev"
 )
 
 type fakeInjector struct {
@@ -320,5 +323,144 @@ func TestRequestFiltering(t *testing.T) {
 	s.ServeHTTP(w, r)
 	if w.Code != http.StatusUnsupportedMediaType {
 		t.Errorf("text/plain offer: status %d, want 415", w.Code)
+	}
+}
+
+func TestListingAPIs(t *testing.T) {
+	_, ts := newTestServer(t, &fakeInjector{}, func(c *Config) {
+		c.ListDisplays = func() ([]capture.Display, error) {
+			return []capture.Display{{Index: 1, Width: 1920, Height: 1080, Primary: true}, {Index: 2, X: 1920, Width: 1280, Height: 1024}}, nil
+		}
+		c.WindowIcon = func(id uint64, size int) (image.Image, error) {
+			if id != 0x1234 {
+				return nil, capture.ErrNotFound
+			}
+			return image.NewNRGBA(image.Rect(0, 0, size, size)), nil
+		}
+	})
+	var ds []struct{ Path string }
+	res, err := http.Get(ts.URL + "/api/displays")
+	if err != nil {
+		t.Fatal(err)
+	}
+	json.NewDecoder(res.Body).Decode(&ds)
+	if len(ds) != 2 || ds[1].Path != "/display2" {
+		t.Errorf("displays = %+v", ds)
+	}
+	res, err = http.Get(ts.URL + "/api/windows/0x1234/icon?size=48")
+	if err != nil {
+		t.Fatal(err)
+	}
+	img, err := png.Decode(res.Body)
+	if err != nil || img.Bounds().Dx() != 48 {
+		t.Errorf("icon: %v %v", img, err)
+	}
+	if res, _ := http.Get(ts.URL + "/api/windows/0x99/icon"); res.StatusCode != 404 {
+		t.Errorf("missing icon status %d", res.StatusCode)
+	}
+}
+
+type fakeMic struct{ samples chan int }
+
+func (m *fakeMic) Write(pcm []int16) error {
+	select {
+	case m.samples <- len(pcm):
+	default:
+	}
+	return nil
+}
+func (m *fakeMic) Close() error { return nil }
+
+type fakePad struct{ states chan vdev.GamepadState }
+
+func (p *fakePad) Update(s vdev.GamepadState) error { p.states <- s; return nil }
+func (p *fakePad) Close() error                     { close(p.states); return nil }
+
+func TestViewerDevices(t *testing.T) {
+	mic := &fakeMic{samples: make(chan int, 1)}
+	pad := &fakePad{states: make(chan vdev.GamepadState, 4)}
+	_, ts := newTestServer(t, &fakeInjector{}, func(c *Config) {
+		c.OpenMicrophone = func() (vdev.Microphone, error) { return mic, nil }
+		c.OpenGamepad = func() (vdev.Gamepad, error) { return pad, nil }
+	})
+	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pc.Close()
+	if _, err := pc.AddTransceiverFromKind(webrtc.RTPCodecTypeVideo, webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly}); err != nil {
+		t.Fatal(err)
+	}
+	micTrack, _ := webrtc.NewTrackLocalStaticSample(webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeOpus}, "mic", "viewer")
+	if _, err := pc.AddTrack(micTrack); err != nil {
+		t.Fatal(err)
+	}
+	dc, _ := pc.CreateDataChannel("gamepad", nil)
+	opened := make(chan struct{})
+	dc.OnOpen(func() { close(opened) })
+
+	offer, _ := pc.CreateOffer(nil)
+	done := webrtc.GatheringCompletePromise(pc)
+	pc.SetLocalDescription(offer)
+	<-done
+	body, _ := json.Marshal(pc.LocalDescription())
+	res, err := http.Post(ts.URL+"/api/offer", "application/json", bytes.NewReader(body))
+	if err != nil || res.StatusCode != 200 {
+		t.Fatalf("offer: %v %v", err, res.Status)
+	}
+	var answer webrtc.SessionDescription
+	json.NewDecoder(res.Body).Decode(&answer)
+	if err := pc.SetRemoteDescription(answer); err != nil {
+		t.Fatal(err)
+	}
+
+	enc, _ := audio.NewOpusEncoder(64000)
+	defer enc.Close()
+	pcm := make([]int16, audio.FrameSamples*audio.Channels)
+	pkt := make([]byte, 1500)
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(10 * time.Millisecond):
+			}
+			n, _ := enc.Encode(pcm, pkt)
+			micTrack.WriteSample(media.Sample{Data: pkt[:n], Duration: 10 * time.Millisecond})
+		}
+	}()
+	select {
+	case n := <-mic.samples:
+		if n != audio.FrameSamples*audio.Channels {
+			t.Errorf("mic got %d samples per write, want %d", n, audio.FrameSamples*audio.Channels)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("viewer microphone audio never reached the virtual mic")
+	}
+
+	select {
+	case <-opened:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gamepad channel did not open")
+	}
+	dc.SendText(`{"i":0,"b":[1,0,0,0,0,0,0,0.5],"a":[0.25,-1,0,0]}`)
+	select {
+	case st := <-pad.states:
+		if st.Buttons[0] != 1 || st.Buttons[7] != 0.5 || st.Axes[0] != 0.25 || st.Axes[1] != -1 {
+			t.Errorf("gamepad state %+v", st)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gamepad state not delivered")
+	}
+	dc.SendText(`{"i":0,"gone":true}`)
+	select {
+	case _, ok := <-pad.states:
+		if ok {
+			t.Error("unexpected update after unplug")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("gamepad not closed on unplug")
 	}
 }

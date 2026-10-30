@@ -36,10 +36,24 @@ type Source interface {
 
 // Window describes a capturable top-level window.
 type Window struct {
-	ID     uint64 `json:"id"`
-	Title  string `json:"title"`
+	ID    uint64 `json:"id"`
+	Title string `json:"title"`
+	// App names the owning application (e.g. "chrome.exe", "firefox"),
+	// used to group windows.
+	App    string `json:"app"`
 	Width  int    `json:"width"`
 	Height int    `json:"height"`
+}
+
+// Display is one monitor, in virtual-desktop coordinates.
+type Display struct {
+	Index   int    `json:"index"` // 1-based; opened as "display<Index>"
+	Name    string `json:"name"`
+	X       int    `json:"x"`
+	Y       int    `json:"y"`
+	Width   int    `json:"width"`
+	Height  int    `json:"height"`
+	Primary bool   `json:"primary"`
 }
 
 // ErrNotFound is returned when the requested window does not exist.
@@ -58,14 +72,22 @@ func ParseID(s string) (uint64, error) {
 func FormatID(id uint64) string { return fmt.Sprintf("0x%x", id) }
 
 // Open opens a capture source. id "" (or "desktop") captures the whole
-// desktop, "test" yields a synthetic animated pattern, anything else is
-// parsed as a window id.
+// virtual desktop across all monitors, "display<N>" one monitor (see
+// Displays), "test" a synthetic animated pattern; anything else is parsed
+// as a window id.
 func Open(id string) (Source, error) {
 	switch id {
 	case "", "desktop":
 		return openDesktop()
 	case "test":
 		return NewTestSource(1280, 720), nil
+	}
+	if n, ok := strings.CutPrefix(id, "display"); ok {
+		i, err := strconv.Atoi(n)
+		if err != nil || i < 1 {
+			return nil, fmt.Errorf("invalid display %q", id)
+		}
+		return openDisplay(i)
 	}
 	wid, err := ParseID(id)
 	if err != nil {
@@ -74,5 +96,13 @@ func Open(id string) (Source, error) {
 	return openWindow(wid)
 }
 
+// Displays enumerates monitors.
+func Displays() ([]Display, error) { return listDisplays() }
+
 // List enumerates capturable windows.
 func List() ([]Window, error) { return listWindows() }
+
+// Icon returns the window's icon, scaled to roughly size x size pixels when
+// the platform offers a choice. It returns ErrNotFound if the window has
+// none.
+func Icon(id uint64, size int) (image.Image, error) { return windowIcon(id, size) }

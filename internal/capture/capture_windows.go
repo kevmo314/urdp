@@ -116,7 +116,26 @@ func listWindows() ([]Window, error) {
 	defer C.capture_free(unsafe.Pointer(items))
 	result := make([]Window, 0, int(count))
 	for _, w := range unsafe.Slice(items, int(count)) {
-		result = append(result, Window{ID: uint64(w.id), Title: C.GoString(&w.title[0]), Width: int(w.w), Height: int(w.h)})
+		result = append(result, Window{
+			ID: uint64(w.id), Title: C.GoString(&w.title[0]), App: C.GoString(&w.app[0]),
+			Width: int(w.w), Height: int(w.h),
+		})
 	}
 	return result, nil
+}
+
+func windowIcon(id uint64, size int) (image.Image, error) {
+	dpiOnce.Do(func() { C.capture_dpi() })
+	if size <= 0 {
+		size = 32
+	}
+	// Bound allocations and the dimensions passed to GDI for caller-supplied sizes.
+	if size > 1024 {
+		return nil, fmt.Errorf("icon size exceeds 1024 pixels")
+	}
+	icon := image.NewRGBA(image.Rect(0, 0, size, size))
+	if hr := C.capture_icon(C.uint64_t(id), C.int(size), (*C.uchar)(unsafe.Pointer(&icon.Pix[0]))); hr < 0 {
+		return nil, captureError("window icon", hr)
+	}
+	return icon, nil
 }

@@ -63,3 +63,27 @@ jobs:
         with:
           name: urdp-windows-amd64
           path: bin/urdp.exe
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install dependencies
+        run: brew install x264 opus pkg-config nasm
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...
+      - name: Build static codecs
+        run: make mac
+      - name: Check runtime dependencies
+        run: |
+          otool -L bin/urdp
+          if otool -L bin/urdp | grep -E '/(opt/homebrew|usr/local)/'; then exit 1; fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: urdp-macos
+          path: bin/urdp

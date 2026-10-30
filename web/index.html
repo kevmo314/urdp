@@ -9,12 +9,21 @@
 <body>
 <video id="video" autoplay playsinline muted disablepictureinpicture></video>
 <div id="gate" class="overlay">
-  <button id="start">Click to connect</button>
-  <p class="hint">Keyboard, mouse and audio are captured while the stream has focus.</p>
+  <div class="term">
+    <div class="prompt"><span class="host" id="host">urdp</span>:<span class="cwd">/</span>$ tree</div>
+    <div id="tree" class="tree"></div>
+    <div class="actions">
+      <button id="start">Connect</button>
+      <a id="back" href="/" hidden>← all sources</a>
+    </div>
+    <p class="hint">Keyboard, mouse and audio are captured while the stream has focus.</p>
+  </div>
 </div>
 <div id="hud" hidden>
   <div id="stats"></div>
   <select id="sources" title="Source"></select>
+  <button id="mic" title="Share your microphone with the host">🎤</button>
+  <button id="cam" title="Share your camera with the host">📷</button>
   <button id="fullscreen" title="Fullscreen (F11)">⛶</button>
 </div>
 <div id="status" class="toast" hidden></div>

@@ -3,16 +3,21 @@
 package server
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"image"
+	"image/png"
 	"io"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"runtime"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +31,7 @@ import (
 	"github.com/kevmo314/urdp/internal/capture"
 	"github.com/kevmo314/urdp/internal/encoder"
 	"github.com/kevmo314/urdp/internal/input"
+	"github.com/kevmo314/urdp/internal/vdev"
 )
 
 type Config struct {
@@ -43,10 +49,17 @@ type Config struct {
 	NAT1To1IPs []string
 
 	// Hooks for tests and alternative platforms; nil means the defaults.
-	OpenSource  func(id string) (capture.Source, error)
-	ListWindows func() ([]capture.Window, error)
-	NewInjector func() (input.Injector, error)
-	OpenAudio   func() (audio.Source, error)
+	OpenSource   func(id string) (capture.Source, error)
+	ListWindows  func() ([]capture.Window, error)
+	ListDisplays func() ([]capture.Display, error)
+	WindowIcon   func(id uint64, size int) (image.Image, error)
+	NewInjector  func() (input.Injector, error)
+	OpenAudio    func() (audio.Source, error)
+
+	// Virtual devices fed by the viewer's microphone, webcam and gamepads.
+	OpenMicrophone func() (vdev.Microphone, error)
+	OpenCamera     func() (vdev.Camera, error)
+	OpenGamepad    func() (vdev.Gamepad, error)
 }
 
 type Server struct {
@@ -70,6 +83,21 @@ func New(cfg Config) (*Server, error) {
 	if cfg.ListWindows == nil {
 		cfg.ListWindows = capture.List
 	}
+	if cfg.OpenMicrophone == nil {
+		cfg.OpenMicrophone = vdev.OpenMicrophone
+	}
+	if cfg.OpenCamera == nil {
+		cfg.OpenCamera = vdev.OpenCamera
+	}
+	if cfg.OpenGamepad == nil {
+		cfg.OpenGamepad = vdev.OpenGamepad
+	}
+	if cfg.ListDisplays == nil {
+		cfg.ListDisplays = capture.Displays
+	}
+	if cfg.WindowIcon == nil {
+		cfg.WindowIcon = capture.Icon
+	}
 	if cfg.NewInjector == nil {
 		cfg.NewInjector = input.New
 	}
@@ -88,7 +116,10 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), pipelines: map[string]*pipeline{}}
 
+	s.mux.HandleFunc("GET /api/info", s.handleInfo)
+	s.mux.HandleFunc("GET /api/displays", s.handleDisplays)
 	s.mux.HandleFunc("GET /api/windows", s.handleWindows)
+	s.mux.HandleFunc("GET /api/windows/{id}/icon", s.handleIcon)
 	s.mux.HandleFunc("POST /api/offer", s.handleOffer)
 	s.mux.HandleFunc("GET /api/stats", s.handleStats)
 	if cfg.WebFS != nil {
@@ -154,6 +185,13 @@ func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 	}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, nil, err
 	}
+	// VP8 is only received: browsers send the viewer's webcam with it.
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeVP8, ClockRate: 90000, RTCPFeedback: fb},
+		PayloadType:        96,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, nil, err
+	}
 	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: PlayoutDelayURI}, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, nil, err
 	}
@@ -213,6 +251,59 @@ func (s *Server) handleWindows(w http.ResponseWriter, r *http.Request) {
 		out = append(out, win{x, "/" + capture.FormatID(x.ID)})
 	}
 	writeJSON(w, out)
+}
+
+func (s *Server) handleInfo(w http.ResponseWriter, r *http.Request) {
+	host, _ := os.Hostname()
+	writeJSON(w, map[string]string{"hostname": host, "os": runtime.GOOS})
+}
+
+func (s *Server) handleDisplays(w http.ResponseWriter, r *http.Request) {
+	ds, err := s.cfg.ListDisplays()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	type display struct {
+		capture.Display
+		Path string `json:"path"`
+	}
+	out := make([]display, 0, len(ds))
+	for _, d := range ds {
+		out = append(out, display{d, fmt.Sprintf("/display%d", d.Index)})
+	}
+	writeJSON(w, out)
+}
+
+// handleIcon serves a window's icon as PNG. ?size= picks the preferred
+// edge length in pixels.
+func (s *Server) handleIcon(w http.ResponseWriter, r *http.Request) {
+	id, err := capture.ParseID(r.PathValue("id"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	size, err := strconv.Atoi(r.URL.Query().Get("size"))
+	if err != nil || size <= 0 || size > 256 {
+		size = 32
+	}
+	img, err := s.cfg.WindowIcon(id, size)
+	if errors.Is(err, capture.ErrNotFound) {
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var buf bytes.Buffer
+	if err := png.Encode(&buf, img); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "image/png")
+	w.Header().Set("Cache-Control", "max-age=300")
+	w.Write(buf.Bytes())
 }
 
 func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
@@ -344,6 +435,7 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 	cleanup := func() {
 		closeOnce.Do(func() {
 			close(closed)
+			sess.pads.close()
 			p.removeViewer(sess)
 			s.release(p)
 			_ = pc.Close()
@@ -370,7 +462,18 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 	if inj := s.injector(); inj != nil {
 		sess.disp = &input.Dispatcher{Inj: inj, Bounds: p.src.Bounds, WindowID: p.src.WindowID()}
 	}
+	sess.pads = &gamepads{open: s.cfg.OpenGamepad}
 	pc.OnDataChannel(sess.onDataChannel)
+	pc.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		switch {
+		case t.Kind() == webrtc.RTPCodecTypeAudio:
+			go s.receiveMicrophone(t)
+		case t.Codec().MimeType == webrtc.MimeTypeVP8:
+			go s.receiveCamera(pc, t)
+		default:
+			go drain(t)
+		}
+	})
 	pc.OnConnectionStateChange(func(st webrtc.PeerConnectionState) {
 		log.Printf("peer %p source %q: %s", pc, id, st)
 		switch st {

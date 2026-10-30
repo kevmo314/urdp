@@ -49,3 +49,37 @@ func (o *OpusEncoder) Close() {
 		o.e = nil
 	}
 }
+
+// OpusDecoder wraps a libopus decoder producing 48kHz stereo PCM.
+type OpusDecoder struct{ d *C.OpusDecoder }
+
+func NewOpusDecoder() (*OpusDecoder, error) {
+	var cerr C.int
+	d := C.opus_decoder_create(SampleRate, Channels, &cerr)
+	if d == nil {
+		return nil, fmt.Errorf("opus: %s", C.GoString(C.opus_strerror(cerr)))
+	}
+	return &OpusDecoder{d: d}, nil
+}
+
+// Decode decodes one packet into pcm (interleaved), returning the number
+// of samples per channel. A nil packet conceals a lost one.
+func (o *OpusDecoder) Decode(pkt []byte, pcm []int16) (int, error) {
+	var data *C.uchar
+	if len(pkt) > 0 {
+		data = (*C.uchar)(unsafe.SliceData(pkt))
+	}
+	n := C.opus_decode(o.d, data, C.opus_int32(len(pkt)),
+		(*C.opus_int16)(unsafe.Pointer(unsafe.SliceData(pcm))), C.int(len(pcm)/Channels), 0)
+	if n < 0 {
+		return 0, fmt.Errorf("opus: %s", C.GoString(C.opus_strerror(n)))
+	}
+	return int(n), nil
+}
+
+func (o *OpusDecoder) Close() {
+	if o.d != nil {
+		C.opus_decoder_destroy(o.d)
+		o.d = nil
+	}
+}

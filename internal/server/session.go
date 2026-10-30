@@ -20,9 +20,14 @@ type session struct {
 	mu   sync.Mutex
 	disp *input.Dispatcher
 	ctl  *webrtc.DataChannel
+	pads *gamepads
 }
 
 func (s *session) onDataChannel(dc *webrtc.DataChannel) {
+	if dc.Label() == "gamepad" {
+		dc.OnMessage(func(m webrtc.DataChannelMessage) { s.pads.handle(m.Data) })
+		return
+	}
 	if dc.Label() == "input" {
 		s.mu.Lock()
 		s.ctl = dc

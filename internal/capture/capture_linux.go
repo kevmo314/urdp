@@ -1,19 +1,21 @@
 package capture
 
 /*
-#cgo pkg-config: x11 xext xcomposite xdamage
+#cgo pkg-config: x11 xext xcomposite xdamage xrandr
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/Xatom.h>
 #include <X11/extensions/XShm.h>
 #include <X11/extensions/Xcomposite.h>
 #include <X11/extensions/Xdamage.h>
+#include <X11/extensions/Xrandr.h>
 #include <poll.h>
 #include <time.h>
 #include <sys/ipc.h>
 #include <sys/shm.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 typedef struct {
 	Display *dpy;
@@ -23,6 +25,7 @@ typedef struct {
 	XImage *img;
 	int w, h;   // current image size
 	int x, y;   // position of target in root coordinates
+	int cx, cy, cw, ch; // crop of the root window (one monitor); cw == 0 for none
 	Damage damage;
 	int damage_event;
 } grabber;
@@ -119,12 +122,17 @@ static void grabber_close(grabber *g) {
 static int grabber_locate(grabber *g, XWindowAttributes *a) {
 	if (!XGetWindowAttributes(g->dpy, g->target, a)) return -2;
 	if (g->win && a->map_state != IsViewable) return -2;
+	if (!g->win && g->cw) {
+		a->width = g->cw;
+		a->height = g->ch;
+	}
 	if ((a->width & ~1) <= 0 || (a->height & ~1) <= 0) return -2;
 	if (g->win) {
 		Window child;
 		XTranslateCoordinates(g->dpy, g->win, DefaultRootWindow(g->dpy), 0, 0, &g->x, &g->y, &child);
 	} else {
-		g->x = g->y = 0;
+		g->x = g->cx;
+		g->y = g->cy;
 	}
 	return 0;
 }
@@ -145,7 +153,7 @@ static int grabber_grab(grabber *g) {
 	if (!g->img || w != g->w || h != g->h) {
 		if (grabber_alloc_image(g, a.visual, a.depth, w, h)) return -1;
 	}
-	if (!XShmGetImage(g->dpy, g->target, g->img, 0, 0, AllPlanes)) return -1;
+	if (!XShmGetImage(g->dpy, g->target, g->img, g->win ? 0 : g->cx, g->win ? 0 : g->cy, AllPlanes)) return -1;
 	return 0;
 }
 
@@ -205,6 +213,51 @@ static char *window_title(Display *d, Window w) {
 	return NULL;
 }
 
+// Monitors as XRandR reports them; caller XRRFreeMonitors()s the result.
+static XRRMonitorInfo *list_monitors(Display *d, int *n) {
+	int ev, er;
+	*n = 0;
+	if (!XRRQueryExtension(d, &ev, &er)) return NULL;
+	return XRRGetMonitors(d, DefaultRootWindow(d), True, n);
+}
+
+static XRRMonitorInfo *monitor_at(XRRMonitorInfo *m, int i) { return &m[i]; }
+
+static char *window_class(Display *d, Window w) {
+	XClassHint h;
+	if (!XGetClassHint(d, w, &h)) return NULL;
+	if (h.res_name) XFree(h.res_name);
+	return h.res_class;
+}
+
+// Copies the _NET_WM_ICON image closest to size (preferring the smallest
+// one at least that big) as 0xAARRGGBB pixels. Returns NULL if none; caller
+// free()s.
+static uint32_t *window_icon(Display *d, Window w, int size, int *iw, int *ih) {
+	unsigned char *data;
+	unsigned long n = get_prop(d, w, atom(d, "_NET_WM_ICON"), XA_CARDINAL, 32, &data);
+	unsigned long *p = (unsigned long *)data, best = n;
+	long bw = 0;
+	for (unsigned long i = 0; i + 2 <= n; ) {
+		long cw = p[i], ch = p[i + 1];
+		if (cw <= 0 || ch <= 0 || i + 2 + cw * ch > n) break;
+		int better = best == n ||
+			(bw < size ? cw > bw : (cw >= size && cw < bw));
+		if (better) { best = i; bw = cw; }
+		i += 2 + cw * ch;
+	}
+	uint32_t *out = NULL;
+	if (best < n) {
+		*iw = p[best];
+		*ih = p[best + 1];
+		out = malloc((size_t)*iw * *ih * 4);
+		// Format-32 properties are arrays of long, one pixel per element.
+		for (long i = 0; out && i < (long)*iw * *ih; i++) out[i] = (uint32_t)p[best + 2 + i];
+	}
+	if (data) XFree(data);
+	return out;
+}
+
 static int window_size(Display *d, Window w, int *width, int *height) {
 	XWindowAttributes a;
 	if (!XGetWindowAttributes(d, w, &a)) return 0;
@@ -233,12 +286,13 @@ type x11Source struct {
 	rect  image.Rectangle
 }
 
-func openX11(win uint64) (Source, error) {
+func openX11(win uint64, crop image.Rectangle) (Source, error) {
 	xlib.Init()
 	g := C.grabber_open(C.ulong(win))
 	if g == nil {
 		return nil, errors.New("x11: cannot open display or MIT-SHM unavailable (is DISPLAY set?)")
 	}
+	g.cx, g.cy, g.cw, g.ch = C.int(crop.Min.X), C.int(crop.Min.Y), C.int(crop.Dx()), C.int(crop.Dy())
 	s := &x11Source{g: g, win: win}
 	if _, _, err := s.Capture(0); err != nil {
 		C.grabber_close(g)
@@ -247,8 +301,71 @@ func openX11(win uint64) (Source, error) {
 	return s, nil
 }
 
-func openDesktop() (Source, error)         { return openX11(0) }
-func openWindow(id uint64) (Source, error) { return openX11(id) }
+// The root window already spans every monitor.
+func openDesktop() (Source, error)         { return openX11(0, image.Rectangle{}) }
+func openWindow(id uint64) (Source, error) { return openX11(id, image.Rectangle{}) }
+
+func openDisplay(i int) (Source, error) {
+	ds, err := listDisplays()
+	if err != nil {
+		return nil, err
+	}
+	if i < 1 || i > len(ds) {
+		return nil, ErrNotFound
+	}
+	d := ds[i-1]
+	return openX11(0, image.Rect(d.X, d.Y, d.X+d.Width, d.Y+d.Height))
+}
+
+func listDisplays() ([]Display, error) {
+	xlib.Init()
+	d := C.XOpenDisplay(nil)
+	if d == nil {
+		return nil, errors.New("x11: cannot open display")
+	}
+	defer C.XCloseDisplay(d)
+	var n C.int
+	ms := C.list_monitors(d, &n)
+	if ms == nil || n == 0 {
+		// No RandR: the screen is a single display.
+		scr := C.XDefaultScreen(d)
+		return []Display{{Index: 1, Name: "screen", Width: int(C.XDisplayWidth(d, scr)), Height: int(C.XDisplayHeight(d, scr)), Primary: true}}, nil
+	}
+	defer C.XRRFreeMonitors(ms)
+	out := make([]Display, int(n))
+	for i := range out {
+		m := C.monitor_at(ms, C.int(i))
+		out[i] = Display{Index: i + 1, X: int(m.x), Y: int(m.y), Width: int(m.width), Height: int(m.height), Primary: m.primary != 0}
+		if name := C.XGetAtomName(d, m.name); name != nil {
+			out[i].Name = C.GoString(name)
+			C.XFree(unsafe.Pointer(name))
+		}
+	}
+	return out, nil
+}
+
+func windowIcon(id uint64, size int) (image.Image, error) {
+	xlib.Init()
+	d := C.XOpenDisplay(nil)
+	if d == nil {
+		return nil, errors.New("x11: cannot open display")
+	}
+	defer C.XCloseDisplay(d)
+	var w, h C.int
+	px := C.window_icon(d, C.Window(id), C.int(size), &w, &h)
+	if px == nil {
+		return nil, ErrNotFound
+	}
+	defer C.free(unsafe.Pointer(px))
+	img := image.NewNRGBA(image.Rect(0, 0, int(w), int(h)))
+	for i, v := range unsafe.Slice((*uint32)(unsafe.Pointer(px)), int(w*h)) {
+		img.Pix[i*4+0] = byte(v >> 16)
+		img.Pix[i*4+1] = byte(v >> 8)
+		img.Pix[i*4+2] = byte(v)
+		img.Pix[i*4+3] = byte(v >> 24)
+	}
+	return img, nil
+}
 
 func (s *x11Source) Capture(wait time.Duration) (*Frame, bool, error) {
 	s.mu.Lock()
@@ -328,6 +445,10 @@ func listWindows() ([]Window, error) {
 		if t := C.window_title(d, id); t != nil {
 			win.Title = C.GoString(t)
 			C.XFree(unsafe.Pointer(t))
+		}
+		if c := C.window_class(d, id); c != nil {
+			win.App = C.GoString(c)
+			C.XFree(unsafe.Pointer(c))
 		}
 		out = append(out, win)
 	}

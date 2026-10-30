@@ -456,6 +456,7 @@ static BOOL CALLBACK enum_window(HWND hwnd, LPARAM param) {
     w->w = rect.right & ~1;
     w->h = rect.bottom & ~1;
     WideCharToMultiByte(CP_UTF8, 0, title, -1, w->title, sizeof(w->title), NULL, NULL);
+    capture_window_app(w->id, w->app, sizeof(w->app));
     return TRUE;
 }
 long capture_list(capture_window **out, int *count) {

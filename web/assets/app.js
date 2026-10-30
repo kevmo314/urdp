@@ -7,10 +7,10 @@ const statsEl = document.getElementById('stats');
 const sourcesEl = document.getElementById('sources');
 const statusEl = document.getElementById('status');
 
-// "/" streams the desktop, "/<window-id>" a single window.
-const source = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''));
+// "/" streams the desktop, "/display<N>" one monitor, "/<window-id>" one window.
+let source = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''));
 
-let pc, input, move;
+let pc, input, move, pads, micSender, camSender;
 
 function toast(msg) {
   statusEl.textContent = msg;
@@ -30,6 +30,17 @@ async function connect() {
 async function negotiate(pc) {
   pc.addTransceiver('video', { direction: 'recvonly' });
   pc.addTransceiver('audio', { direction: 'recvonly' });
+  // The viewer's mic and camera, sent to the host's virtual devices. They
+  // start empty; toggling swaps tracks in without renegotiating.
+  micSender = pc.addTransceiver('audio', { direction: 'sendonly' }).sender;
+  const camTx = pc.addTransceiver('video', { direction: 'sendonly' });
+  const vp8 = RTCRtpSender.getCapabilities?.('video')?.codecs.filter((c) => /vp8|rtx/i.test(c.mimeType));
+  if (vp8?.length) camTx.setCodecPreferences(vp8); // the host decodes VP8
+  camSender = camTx.sender;
+  for (const [sender, track] of [[micSender, micTrack], [camSender, camTrack]]) {
+    if (track) sender.replaceTrack(track);
+  }
+  pads = pc.createDataChannel('gamepad', { ordered: false, maxRetransmits: 0 });
   input = pc.createDataChannel('input', { ordered: true });
   move = pc.createDataChannel('move', { ordered: false, maxRetransmits: 0 });
   move.bufferedAmountLowThreshold = 0;
@@ -170,8 +181,12 @@ document.getElementById('fullscreen').onclick = async () => {
 
 async function loadSources() {
   try {
-    const wins = await (await fetch('/api/windows')).json();
-    const opts = [['/', 'Entire desktop'], ...wins.map((w) => [w.path, `${w.title || '(untitled)'} — ${w.width}×${w.height}`])];
+    const [displays, wins] = await Promise.all(['/api/displays', '/api/windows'].map((u) => fetch(u).then((r) => r.json()).catch(() => [])));
+    const opts = [
+      ['/', 'Entire desktop'],
+      ...displays.map((d) => [d.path, `Display ${d.index} — ${d.width}×${d.height}`]),
+      ...wins.map((w) => [w.path, `${w.app ? `${w.app}: ` : ''}${w.title || '(untitled)'} — ${w.width}×${w.height}`]),
+    ];
     sourcesEl.replaceChildren(...opts.map(([path, label]) => {
       const o = new Option(label, path);
       o.selected = path.replace(/^\//, '') === source;
@@ -180,7 +195,7 @@ async function loadSources() {
   } catch { /* window listing is optional */ }
 }
 sourcesEl.onfocus = loadSources;
-sourcesEl.onchange = () => { location.pathname = sourcesEl.value; };
+sourcesEl.onchange = () => { location.href = sourcesEl.value + location.search; };
 
 // ---- stats ----
 
@@ -212,18 +227,188 @@ async function updateStats() {
   statsEl.textContent = lines.join('\n');
 }
 
+// ---- viewer devices ----
+
+let micTrack, camTrack;
+
+async function toggleDevice(kind) {
+  const btn = document.getElementById(kind);
+  const sender = kind === 'mic' ? micSender : camSender;
+  let track = kind === 'mic' ? micTrack : camTrack;
+  if (track) {
+    track.stop();
+    track = undefined;
+  } else {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia(kind === 'mic'
+        // Keep echo cancellation: the host's audio plays through this
+        // page and would otherwise loop back into the host's mic.
+        ? { audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } }
+        : { video: { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } } });
+      track = stream.getTracks()[0];
+      if (kind === 'cam') track.contentHint = 'motion';
+    } catch (e) {
+      toast(`${kind === 'mic' ? 'Microphone' : 'Camera'}: ${e.message}`);
+      setTimeout(() => toast(''), 3000);
+      return;
+    }
+  }
+  if (kind === 'mic') micTrack = track; else camTrack = track;
+  await sender?.replaceTrack(track ?? null);
+  btn.classList.toggle('on', !!track);
+}
+document.getElementById('mic').onclick = () => toggleDevice('mic');
+document.getElementById('cam').onclick = () => toggleDevice('cam');
+
+// Gamepads are polled (the Gamepad API has no change events) and each
+// changed state is sent whole, so a lost message is fixed by the next one;
+// a periodic resend covers a lost final state.
+const padState = new Map();
+function pollGamepads() {
+  requestAnimationFrame(pollGamepads);
+  if (pads?.readyState !== 'open') return;
+  const seen = new Set();
+  const now = performance.now();
+  for (const gp of navigator.getGamepads()) {
+    if (!gp || gp.mapping !== 'standard') continue;
+    seen.add(gp.index);
+    const msg = JSON.stringify({
+      i: gp.index,
+      b: gp.buttons.slice(0, 17).map((b) => +b.value.toFixed(3)),
+      a: gp.axes.slice(0, 4).map((a) => +a.toFixed(3)),
+    });
+    const prev = padState.get(gp.index);
+    if (msg !== prev?.msg || now - prev.at > 250) {
+      pads.send(msg);
+      padState.set(gp.index, { msg, at: now });
+    }
+  }
+  for (const i of padState.keys()) {
+    if (!seen.has(i)) {
+      pads.send(JSON.stringify({ i, gone: true }));
+      padState.delete(i);
+    }
+  }
+}
+requestAnimationFrame(pollGamepads);
+
+// ---- source tree ----
+// The landing page lists every source as a `tree`-style listing: the
+// desktop and its displays, then windows grouped by application.
+
+const treeEl = document.getElementById('tree');
+
+function el(tag, cls, text) {
+  const e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text != null) e.textContent = text;
+  return e;
+}
+
+function row(prefix, { path, name, meta, icon, glyph, dir }) {
+  const a = el(path ? 'a' : 'div');
+  if (path) {
+    a.href = path;
+    if (path.replace(/^\//, '') === source) a.classList.add('current');
+    a.onclick = (e) => {
+      e.preventDefault();
+      history.pushState(null, '', path);
+      source = path.replace(/^\//, '');
+      start();
+    };
+  }
+  a.append(el('span', 'branch', prefix));
+  if (icon) {
+    const img = el('img', 'icon');
+    img.src = icon;
+    img.alt = '';
+    img.onerror = () => img.replaceWith(el('span', 'glyph', glyph ?? '▫'));
+    a.append(img);
+  } else {
+    a.append(el('span', 'glyph', glyph ?? '▫'));
+  }
+  a.append(el('span', dir ? 'name dir' : 'name', name));
+  if (meta) a.append(el('span', 'meta', meta));
+  return a;
+}
+
+async function loadTree() {
+  const get = (u) => fetch(u).then((r) => (r.ok ? r.json() : [])).catch(() => []);
+  const [info, displays, windows] = await Promise.all([get('/api/info'), get('/api/displays'), get('/api/windows')]);
+  if (info.hostname) document.getElementById('host').textContent = info.hostname;
+
+  const groups = new Map();
+  for (const w of windows) {
+    const app = w.app || '(other)';
+    if (!groups.has(app)) groups.set(app, []);
+    groups.get(app).push(w);
+  }
+  const apps = [...groups.keys()].sort((a, b) => a.localeCompare(b, undefined, { sensitivity: 'base' }));
+  const size = (o) => `${o.width}×${o.height}`;
+  const iconURL = (w) => `/api/windows/${w.path.slice(1)}/icon?size=${Math.ceil(16 * devicePixelRatio)}`;
+
+  const rows = [];
+  const top = 1 + apps.length;
+  let i = 0;
+  const branch = (last) => (last ? '└── ' : '├── ');
+  const indent = (last) => (last ? '    ' : '│   ');
+
+  const desktopLast = ++i === top;
+  const bounds = displays.reduce((b, d) => ({
+    x0: Math.min(b.x0, d.x), y0: Math.min(b.y0, d.y), x1: Math.max(b.x1, d.x + d.width), y1: Math.max(b.y1, d.y + d.height),
+  }), { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
+  rows.push(row(branch(desktopLast), {
+    path: '/', name: 'desktop/', dir: true, glyph: '🖥',
+    meta: displays.length ? `${bounds.x1 - bounds.x0}×${bounds.y1 - bounds.y0}` : '',
+  }));
+  displays.forEach((d, j) => {
+    const last = j === displays.length - 1;
+    rows.push(row(indent(desktopLast) + branch(last), {
+      path: d.path, name: `display${d.index}${d.name ? ` (${d.name})` : ''}${d.primary ? ' *' : ''}`, glyph: '▭', meta: size(d),
+    }));
+  });
+
+  for (const app of apps) {
+    const appLast = ++i === top;
+    const wins = groups.get(app);
+    rows.push(row(branch(appLast), { name: `${app}/`, dir: true, icon: iconURL(wins[0]), glyph: '▸' }));
+    wins.forEach((w, j) => {
+      rows.push(row(indent(appLast) + branch(j === wins.length - 1), {
+        path: w.path, name: w.title || '(untitled)', icon: iconURL(w), meta: size(w),
+      }));
+    });
+  }
+  const n = (k, word) => `${k} ${word}${k === 1 ? '' : 's'}`;
+  rows.push(el('div', 'summary', `\n${n(apps.length, 'application')}, ${n(windows.length, 'window')}, ${n(displays.length, 'display')}`));
+  treeEl.replaceChildren(...rows);
+}
+
 // ---- start ----
 
+let started = false;
 // Audio playback needs a user gesture, so connect behind a click.
-document.getElementById('start').onclick = async () => {
+async function start() {
   gate.hidden = true;
   hud.hidden = false;
   video.muted = false;
   video.focus();
   loadSources();
+  if (started) return reconnect();
+  started = true;
   setInterval(updateStats, 1000);
   try { await connect(); } catch (e) { toast(`Error: ${e.message}`); setTimeout(reconnect, 2000); }
-};
+}
+document.getElementById('start').onclick = start;
+window.addEventListener('popstate', () => location.reload());
+
+if (source) {
+  document.getElementById('start').textContent = `Connect to /${source}`;
+  document.getElementById('back').hidden = false;
+} else {
+  document.getElementById('start').textContent = 'Connect to desktop';
+}
+loadTree();
+const treeTimer = setInterval(() => (gate.hidden ? clearInterval(treeTimer) : loadTree()), 2000);
 
 // ---- latency probe ----
 // With ?probe, while viewing this machine's own desktop, the page paints a
