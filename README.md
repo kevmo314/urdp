@@ -1,6 +1,8 @@
 # urdp
 
-A minimal, low-latency remote desktop that runs in the browser. It's a single Go binary that serves a web page and streams the desktop, or a single window, over WebRTC. Your mouse and keyboard are sent back the same way.
+A minimal, low-latency remote desktop that runs in the browser. It's a single Go binary for Linux, Windows or macOS that serves a web page and streams the desktop, one monitor, or a single window over WebRTC, with system audio. Your mouse, keyboard and gamepads are sent back the same way. Your microphone, webcam and (experimentally) USB devices can show up on the host too.
+
+Prebuilt binaries are on the [releases page](https://github.com/kevmo314/urdp/releases): `nightly` tracks `main`.
 
 ```
 ./urdp                 # serves http://<host>:8000
@@ -9,21 +11,27 @@ A minimal, low-latency remote desktop that runs in the browser. It's a single Go
 URDP_PASSWORD=hunter2 ./urdp -hosts desk.example.com   # require a password; allow that hostname
 ```
 
-- `http://host:8000/` streams the entire desktop.
+- `http://host:8000/` lists every source as a `tree`-style listing: the desktop and its monitors, then windows grouped by application, with their icons. Click one to stream it.
+- The desktop stream (the `desktop/` entry) covers all monitors stitched together. `/display1`, `/display2`, … stream one monitor each.
 - `http://host:8000/<window-id>` (e.g. `/0x1a00007`) streams one window, and input is mapped into that window.
-- `http://host:8000/api/windows` lists windows as JSON. The source picker in the page uses it.
+- The page uses these JSON APIs: `/api/displays`, `/api/windows` and `/api/windows/<id>/icon`.
+- In the stream, the 🎤 and 📷 buttons share your microphone and camera with the host. Connected gamepads are forwarded automatically.
 - Add `?probe` when viewing the same machine's desktop to measure capture→display latency in the browser (see below).
 
 ## How it works
 
-| Stage | Linux (X11) | Windows |
-|---|---|---|
-| Desktop capture | XShm `XShmGetImage` on the root window | DXGI Desktop Duplication |
-| Window capture | XComposite-redirected window + XShm | `PrintWindow(PW_RENDERFULLCONTENT)` |
-| Change detection | XDamage | DXGI frame notifications |
-| Video encode | libx264 (cgo) | libx264 (static, cgo) |
-| Audio | PulseAudio/PipeWire monitor of the default sink → Opus | WASAPI loopback → Opus |
-| Input | XTest | `SendInput` (scancodes) |
+| Stage | Linux (X11) | Windows | macOS |
+|---|---|---|---|
+| Desktop capture | XShm on the root window (cropped per monitor via XRandR) | DXGI Desktop Duplication per output, stitched, dirty rects only | ScreenCaptureKit per display, stitched |
+| Window capture | XComposite-redirected window + XShm | Windows.Graphics.Capture (PrintWindow fallback) | ScreenCaptureKit window filter |
+| Change detection | XDamage | DXGI / WGC frame events | SCFrameStatus |
+| Video encode | libx264 | libx264 (static) | libx264 (static) |
+| Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
+| Input | XTest | `SendInput` (scancodes) | CGEvent |
+| Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | — |
+| Viewer camera | v4l2loopback | OBS Virtual Camera | — |
+| Viewer gamepad | uinput (Xbox 360) | ViGEmBus (Xbox 360) | — |
+| USB passthrough | vhci-hcd | usbip-win2 (untested) | — |
 
 Every viewer of a source shares one capture→encode pipeline and one track. Audio is captured once and shared by all viewers.
 
@@ -80,7 +88,22 @@ sudo apt install gcc-mingw-w64-x86-64 nasm
 make windows    # builds static x264 + Opus into third_party/, then bin/urdp.exe
 ```
 
+Viewer devices on Windows need drivers that can't be bundled:
+
+- **Microphone.** Install [VB-Audio Virtual Cable](https://vb-audio.com/Cable/). urdp plays into "CABLE Input", and apps pick "CABLE Output" as their microphone. Set `URDP_MIC_DEVICE` to use a different render endpoint.
+- **Camera.** Install OBS Studio and register its virtual camera once as Administrator, using `data\obs-plugins\win-dshow\virtualcam-install.bat` in the OBS folder. urdp feeds frames into "OBS Virtual Camera", and OBS doesn't need to be running.
+- **Gamepad.** Install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases). Each pad appears as an Xbox 360 controller.
+
 When running `urdp.exe` from WSL, Windows may ask whether to allow it through the firewall. Access from the same machine over loopback works either way. Allow it if you want other machines to connect.
+
+### macOS
+
+`make mac` builds static x264 and Opus for macOS 13 and later, then `bin/urdp`. The binary links only system frameworks. The first time it runs, grant permissions in **System Settings → Privacy & Security** to the app that launches it (Terminal, or `sshd-keygen-wrapper` when started over SSH):
+
+- **Screen & System Audio Recording**, for capture and audio.
+- **Accessibility**, for mouse and keyboard input.
+
+Then restart urdp. Viewer devices aren't implemented on macOS yet.
 
 ### Networking notes
 

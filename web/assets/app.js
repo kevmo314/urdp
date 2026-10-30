@@ -351,10 +351,12 @@ function row(prefix, { path, name, meta, icon, glyph, dir }) {
 
 async function loadTree() {
   const get = (u) => fetch(u).then((r) => (r.ok ? r.json() : [])).catch(() => []);
-  const [info, displays, windows] = await Promise.all([get('/api/info'), get('/api/displays'), get('/api/windows')]);
+  let [info, displays, windows] = await Promise.all([get('/api/info'), get('/api/displays'), get('/api/windows')]);
   if (info.hostname) document.getElementById('host').textContent = info.hostname;
 
   const groups = new Map();
+  // Tray stubs and helper windows are rarely worth streaming.
+  windows = windows.filter((w) => w.width >= 64 && w.height >= 48);
   for (const w of windows) {
     const app = w.app || '(other)';
     if (!groups.has(app)) groups.set(app, []);
