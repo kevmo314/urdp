@@ -21,10 +21,11 @@ import (
 // replayed into a virtual device on the host.
 
 // receiveMicrophone decodes the viewer's microphone into a virtual mic.
-func (s *Server) receiveMicrophone(t *webrtc.TrackRemote) {
+func (s *Server) receiveMicrophone(t *webrtc.TrackRemote, notify func(dev, msg string)) {
 	mic, err := s.cfg.OpenMicrophone()
 	if err != nil {
 		log.Printf("viewer microphone ignored: %v", err)
+		notify("mic", "The host can't use your microphone: "+err.Error())
 		drain(t)
 		return
 	}
@@ -64,10 +65,11 @@ func (s *Server) receiveMicrophone(t *webrtc.TrackRemote) {
 }
 
 // receiveCamera decodes the viewer's VP8 webcam into a virtual camera.
-func (s *Server) receiveCamera(pc *webrtc.PeerConnection, t *webrtc.TrackRemote) {
+func (s *Server) receiveCamera(pc *webrtc.PeerConnection, t *webrtc.TrackRemote, notify func(dev, msg string)) {
 	cam, err := s.cfg.OpenCamera()
 	if err != nil {
 		log.Printf("viewer camera ignored: %v", err)
+		notify("cam", "The host can't use your camera: "+err.Error())
 		drain(t)
 		return
 	}
@@ -142,7 +144,8 @@ type gamepadMsg struct {
 // gamepads holds one viewer's virtual controllers, keyed by the browser's
 // gamepad index.
 type gamepads struct {
-	open func() (vdev.Gamepad, error)
+	open   func() (vdev.Gamepad, error)
+	notify func(dev, msg string)
 
 	mu     sync.Mutex
 	pads   map[int]vdev.Gamepad
@@ -176,6 +179,9 @@ func (g *gamepads) handle(data []byte) {
 		var err error
 		if pad, err = g.open(); err != nil {
 			log.Printf("viewer gamepad ignored: %v", err)
+			if g.notify != nil {
+				g.notify("gamepad", "The host can't use your gamepad: "+err.Error())
+			}
 			g.failed = true // don't retry (and log) on every update
 			return
 		}

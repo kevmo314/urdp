@@ -49,6 +49,7 @@ async function negotiate(pc) {
   input.onmessage = (e) => {
     const m = JSON.parse(e.data);
     if (m.t === 'ended') sourceGone();
+    if (m.t === 'notice') deviceNotice(m);
   };
 
   pc.ontrack = (e) => {
@@ -294,6 +295,14 @@ async function toggleDevice(kind) {
   if (kind === 'mic') micTrack = track; else camTrack = track;
   await sender?.replaceTrack(track ?? null);
   btn.classList.toggle('on', !!track);
+}
+// The host couldn't use a shared device (e.g. no virtual camera driver):
+// say why and switch it back off.
+function deviceNotice({ dev, msg }) {
+  toast(msg);
+  setTimeout(() => toast(''), 10000);
+  const track = dev === 'mic' ? micTrack : dev === 'cam' ? camTrack : undefined;
+  if (track) toggleDevice(dev);
 }
 document.getElementById('mic').onclick = () => toggleDevice('mic');
 document.getElementById('cam').onclick = () => toggleDevice('cam');

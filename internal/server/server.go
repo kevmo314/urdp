@@ -475,14 +475,14 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 	if inj := s.injector(); inj != nil {
 		sess.disp = &input.Dispatcher{Inj: inj, Bounds: p.src.Bounds, WindowID: p.src.WindowID()}
 	}
-	sess.pads = &gamepads{open: s.cfg.OpenGamepad}
+	sess.pads = &gamepads{open: s.cfg.OpenGamepad, notify: sess.notify}
 	pc.OnDataChannel(sess.onDataChannel)
 	pc.OnTrack(func(t *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		switch {
 		case t.Kind() == webrtc.RTPCodecTypeAudio:
-			go s.receiveMicrophone(t)
+			go s.receiveMicrophone(t, sess.notify)
 		case t.Codec().MimeType == webrtc.MimeTypeVP8:
-			go s.receiveCamera(pc, t)
+			go s.receiveCamera(pc, t, sess.notify)
 		default:
 			go drain(t)
 		}

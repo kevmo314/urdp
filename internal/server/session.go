@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"log"
 	"sync"
 
@@ -62,6 +63,12 @@ func (s *session) release() {
 	if s.disp != nil {
 		s.disp.Release()
 	}
+}
+
+// notify tells the viewer why one of their devices isn't being used.
+func (s *session) notify(dev, msg string) {
+	b, _ := json.Marshal(map[string]string{"t": "notice", "dev": dev, "msg": msg})
+	s.send(string(b))
 }
 
 func (s *session) send(msg string) {
