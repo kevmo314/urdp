@@ -17,7 +17,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev libxrandr-dev \
-            libx264-dev libopus-dev libpulse-dev libvpx-dev xvfb xterm xdotool \
+            libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev xvfb xterm xdotool \
             pulseaudio pulseaudio-utils ffmpeg
       # The virtual device tests skip themselves if these fail.
       - name: Virtual device setup (uinput, PulseAudio)
@@ -30,6 +30,21 @@ jobs:
           sudo udevadm control --reload-rules
           pulseaudio --start --exit-idle-time=-1
           pactl info
+      # A PipeWire session (no pipewire-pulse: PulseAudio above serves the
+      # mic test) for the PipeWire camera.
+      - name: Virtual device setup (PipeWire)
+        continue-on-error: true
+        run: |
+          sudo apt-get install -y pipewire pipewire-bin wireplumber gstreamer1.0-pipewire gstreamer1.0-tools
+          if [ -z "$XDG_RUNTIME_DIR" ]; then
+            export XDG_RUNTIME_DIR=$RUNNER_TEMP/xdg && mkdir -m 700 -p $XDG_RUNTIME_DIR
+            echo "XDG_RUNTIME_DIR=$XDG_RUNTIME_DIR" >> $GITHUB_ENV
+          fi
+          nohup pipewire > $RUNNER_TEMP/pipewire.log 2>&1 &
+          sleep 1
+          nohup wireplumber > $RUNNER_TEMP/wireplumber.log 2>&1 &
+          sleep 2
+          pw-cli ls Node
       - name: Virtual device setup (v4l2loopback)
         continue-on-error: true
         run: |

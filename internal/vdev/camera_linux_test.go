@@ -47,16 +47,25 @@ func TestPackPlane(t *testing.T) {
 	}
 }
 
-func TestCamera(t *testing.T) {
+func TestOpenCamera(t *testing.T) {
 	cam, err := OpenCamera()
 	if errors.Is(err, ErrUnsupported) {
-		if !strings.Contains(err.Error(), "modprobe v4l2loopback") && !strings.Contains(err.Error(), "video group") {
+		if !strings.Contains(err.Error(), "PipeWire") ||
+			(!strings.Contains(err.Error(), "modprobe v4l2loopback") && !strings.Contains(err.Error(), "video group")) {
 			t.Errorf("unhelpful error: %v", err)
 		}
 		t.Skip(err)
 	}
 	if err != nil {
 		t.Fatal(err)
+	}
+	cam.Close()
+}
+
+func TestLoopbackCamera(t *testing.T) {
+	cam, err := openLoopbackCamera()
+	if err != nil {
+		t.Skip(err)
 	}
 	defer cam.Close()
 	if _, err := exec.LookPath("ffmpeg"); err != nil {

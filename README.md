@@ -29,7 +29,7 @@ URDP_PASSWORD=hunter2 ./urdp -hosts desk.example.com   # require a password; all
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
 | Viewer mic | PulseAudio virtual source | VB-Audio Virtual Cable | — |
-| Viewer camera | v4l2loopback | OBS Virtual Camera | — |
+| Viewer camera | PipeWire camera node (v4l2loopback fallback) | OBS Virtual Camera | — |
 | Viewer gamepad | uinput (Xbox 360) | ViGEmBus (Xbox 360) | — |
 | USB passthrough | vhci-hcd | usbip-win2 (untested) | — |
 
@@ -60,7 +60,7 @@ The default probe covers the sender page's paint, capture, encode, network, deco
 
 ```
 sudo apt install pkg-config libx11-dev libxext-dev libxtst-dev libxcomposite-dev libxdamage-dev \
-  libx264-dev libopus-dev libpulse-dev libvpx-dev
+  libx264-dev libopus-dev libpulse-dev libpipewire-0.3-dev libvpx-dev
 make            # bin/urdp
 make test
 ```
@@ -72,7 +72,9 @@ Run it inside an X11 session, with `DISPLAY` set. Wayland sessions are not suppo
 The viewer's microphone, webcam and gamepads can appear on the host as virtual devices. Each device needs some host setup:
 
 - **Microphone.** Needs PulseAudio or PipeWire's pulse server. While a viewer shares their mic, urdp loads a null sink and a remapped source. Apps then list it as an input called "urdp Microphone". The modules are unloaded when the last viewer stops.
-- **Camera.** Needs v4l2loopback: `sudo apt install v4l2loopback-dkms`, then `sudo modprobe v4l2loopback exclusive_caps=1 card_label="urdp Camera"`. To load it at boot, put `v4l2loopback` in `/etc/modules-load.d/` and the options in `/etc/modprobe.d/`. urdp picks the device labelled "urdp Camera", or else any loopback device. Your user needs write access to it, which the `video` group normally gives.
+- **Camera.** If PipeWire is running (the default on current Ubuntu, Fedora and most desktops), urdp publishes a PipeWire camera node, "urdp Camera" (`node.name` `urdp-camera`, `media.class` `Video/Source`, `media.role` `Camera`). No kernel module or root is needed. It offers I420, NV12 and YUY2 at the viewer's frame size and renegotiates when that size changes. Apps that use PipeWire cameras see it: Chrome and Firefox (through the camera portal; in Chrome, enable `chrome://flags/#enable-webrtc-pipewire-camera`), OBS's "Video Capture Device (PipeWire)" source, GStreamer's `pipewiresrc`, and Snapshot/Cheese. You can check it with `pw-cli ls Node`.
+
+  Apps that only speak V4L2 can't see PipeWire cameras. That includes older Zoom and Skype builds, ffmpeg `-f v4l2`, and many Electron apps. For those, install v4l2loopback (an out-of-tree kernel module) instead: `sudo apt install v4l2loopback-dkms`, then `sudo modprobe v4l2loopback exclusive_caps=1 card_label="urdp Camera"`. To load it at boot, put `v4l2loopback` in `/etc/modules-load.d/` and the options in `/etc/modprobe.d/`. urdp uses it when PipeWire isn't reachable, or always with `URDP_CAMERA=v4l2` (`URDP_CAMERA=pipewire` forces PipeWire). It picks the device labelled "urdp Camera", or else any loopback device. Your user needs write access to it, which the `video` group normally gives.
 - **Gamepad.** Each pad becomes a virtual Xbox 360 controller through `/dev/uinput`, which is root-only by default. To allow access, add a udev rule and join the `input` group, then log in again:
 
   ```
