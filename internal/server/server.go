@@ -221,7 +221,16 @@ func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, ir); err != nil {
 		return nil, nil, err
 	}
-	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
+	// The useful subset of RegisterDefaultInterceptors: retransmissions,
+	// sender/receiver reports, and TWCC feedback for what the viewer sends
+	// us. The default stats interceptor does per-packet work nobody reads.
+	if err := webrtc.ConfigureNack(m, ir); err != nil {
+		return nil, nil, err
+	}
+	if err := webrtc.ConfigureRTCPReports(ir); err != nil {
+		return nil, nil, err
+	}
+	if err := webrtc.ConfigureTWCCSender(m, ir); err != nil {
 		return nil, nil, err
 	}
 	ir.Add(playoutDelayFactory{})

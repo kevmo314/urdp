@@ -10,6 +10,7 @@ const statusEl = document.getElementById('status');
 // "/" streams the desktop, "/display<N>" one monitor, "/<window-id>" one window.
 let source = decodeURIComponent(location.pathname.replace(/^\/+|\/+$/g, ''));
 
+const audioEl = new Audio();
 let pc, input, move, pads, micSender, camSender;
 
 function toast(msg) {
@@ -50,14 +51,19 @@ async function negotiate(pc) {
     if (m.t === 'ended') toast('Source closed');
   };
 
-  const stream = new MediaStream();
   pc.ontrack = (e) => {
     // Render frames as soon as they decode instead of buffering for
     // smoothness; this is the single biggest client-side latency knob.
     if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
     if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0;
-    stream.addTrack(e.track);
-    video.srcObject = stream;
+    // Audio plays from its own element so the video element never waits on
+    // (or gets re-initialized by) the audio track.
+    if (e.track.kind === 'video') {
+      video.srcObject = new MediaStream([e.track]);
+    } else {
+      audioEl.srcObject = new MediaStream([e.track]);
+      audioEl.play().catch(() => {});
+    }
   };
   pc.onconnectionstatechange = () => {
     const s = pc.connectionState;
@@ -106,9 +112,14 @@ function send(ch, msg) {
   if (ch?.readyState === 'open') ch.send(JSON.stringify(msg));
 }
 
+// The video's layout box, cached: raw pointer events can arrive at 1kHz
+// and reading layout for each is wasted work.
+let videoRect = video.getBoundingClientRect();
+new ResizeObserver(() => { videoRect = video.getBoundingClientRect(); }).observe(video);
+
 // Normalized [0,1] position within the letterboxed video content.
 function norm(e) {
-  const r = video.getBoundingClientRect();
+  const r = videoRect;
   const vw = video.videoWidth || r.width, vh = video.videoHeight || r.height;
   const scale = Math.min(r.width / vw, r.height / vh);
   const w = vw * scale, h = vh * scale;
@@ -121,12 +132,18 @@ function norm(e) {
 // channel is backed up, keep just the newest one and send it once it drains.
 let pendingMove;
 function flushMove() {
-  if (pendingMove && move?.bufferedAmount === 0) {
+  // A little slack: a single queued message usually means it's in flight,
+  // not that the link is congested.
+  if (pendingMove && move?.bufferedAmount < 256) {
     send(move, pendingMove);
     pendingMove = undefined;
   }
 }
-video.addEventListener('pointermove', (e) => {
+// pointerrawupdate fires as soon as the OS reports motion; pointermove is
+// held back until the next animation frame (up to 16ms later). It's only
+// exposed in secure contexts (https, localhost).
+const moveEvent = 'onpointerrawupdate' in window ? 'pointerrawupdate' : 'pointermove';
+video.addEventListener(moveEvent, (e) => {
   pendingMove = { t: 'm', ...norm(e) };
   flushMove();
 });
@@ -395,7 +412,7 @@ let started = false;
 async function start() {
   gate.hidden = true;
   hud.hidden = false;
-  video.muted = false;
+  audioEl.play().catch(() => {}); // unlocks audio within the click
   video.focus();
   loadSources();
   if (started) return reconnect();
@@ -431,7 +448,9 @@ if (probe) {
   c.height = CELL;
   c.style.cssText = `position:fixed;left:0;top:0;width:${c.width}px;height:${c.height}px;z-index:9;image-rendering:pixelated`;
   document.body.append(c);
-  const ctx = c.getContext('2d');
+  // desynchronized lets the canvas reach the screen without waiting on the
+  // page compositor, so the painted timestamp is fresher.
+  const ctx = c.getContext('2d', { alpha: false, desynchronized: true });
   const paint = () => {
     const t = Math.round(performance.now()) & 0xfff;
     for (let i = 0; i < BITS; i++) {
@@ -443,6 +462,8 @@ if (probe) {
   paint();
 
   const sample = document.createElement('canvas').getContext('2d', { willReadFrequently: true });
+  sample.canvas.width = BITS;
+  sample.canvas.height = 1;
   const read = () => {
     video.requestVideoFrameCallback(read);
     // Where the probe sits on the physical screen, in video pixels.
@@ -450,8 +471,6 @@ if (probe) {
     const x0 = (screenX + (outerWidth - innerWidth) / 2) * dpr;
     const y0 = (screenY + outerHeight - innerHeight) * dpr;
     const cell = CELL * dpr;
-    sample.canvas.width = BITS;
-    sample.canvas.height = 1;
     // Sample the center of each block.
     for (let i = 0; i < BITS; i++) {
       sample.drawImage(video, x0 + (i + 0.5) * cell - 1, y0 + cell / 2 - 1, 2, 2, i, 0, 1, 1);
@@ -472,3 +491,12 @@ function probeStats() {
   probeLatency = [];
   return `e2e p50 ${p(0.5)}ms  p90 ${p(0.9)}ms`;
 }
+
+// ---- HUD ----
+// Keep the HUD out of the render tree unless the pointer is near the top:
+// anything drawn over the video stops the browser from scanning it out as
+// a hardware overlay, which can cost a compositor frame.
+window.addEventListener('pointermove', (e) => {
+  if (!gate.hidden) return;
+  hud.hidden = e.clientY > 48 && !hud.matches(':hover') && document.activeElement !== sourcesEl;
+});

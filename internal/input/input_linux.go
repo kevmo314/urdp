@@ -7,11 +7,15 @@ package input
 #include <X11/extensions/XTest.h>
 #include <string.h>
 
+static Atom net_active_window;
+
 static Display *xt_open(void) {
 	Display *d = XOpenDisplay(NULL);
 	if (!d) return NULL;
 	int ev, er, maj, min;
 	if (!XTestQueryExtension(d, &ev, &er, &maj, &min)) { XCloseDisplay(d); return NULL; }
+	// Interned once: each lookup is a round trip, and focus runs on clicks.
+	net_active_window = XInternAtom(d, "_NET_ACTIVE_WINDOW", False);
 	return d;
 }
 
@@ -40,7 +44,7 @@ static void xt_focus(Display *d, Window w) {
 	memset(&e, 0, sizeof(e));
 	e.xclient.type = ClientMessage;
 	e.xclient.window = w;
-	e.xclient.message_type = XInternAtom(d, "_NET_ACTIVE_WINDOW", False);
+	e.xclient.message_type = net_active_window;
 	e.xclient.format = 32;
 	e.xclient.data.l[0] = 2; // source: pager, so WMs honor it
 	e.xclient.data.l[1] = CurrentTime;
