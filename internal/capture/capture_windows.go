@@ -1,7 +1,7 @@
 package capture
 
 /*
-#cgo windows LDFLAGS: -ld3d11 -ldxgi -ldxguid -ldwmapi -lgdi32 -luser32
+#cgo windows LDFLAGS: -ld3d11 -ldxgi -ldxguid -ldwmapi -lgdi32 -luser32 -lruntimeobject -lole32 -static-libgcc -static-libstdc++
 #include "native_windows.h"
 */
 import "C"
@@ -17,12 +17,11 @@ import (
 var dpiOnce sync.Once
 
 type windowsSource struct {
-	mu       sync.Mutex
-	native   *C.capture_native
-	id       uint64
-	bounds   image.Rectangle
-	frame    Frame
-	hasFrame bool
+	mu     sync.Mutex
+	native *C.capture_native
+	id     uint64
+	bounds image.Rectangle
+	frame  Frame
 }
 
 func captureError(op string, hr C.long) error {
@@ -56,11 +55,6 @@ func (s *windowsSource) resize() error {
 		return captureError("capture bounds", hr)
 	}
 	s.bounds = image.Rect(int(r.x), int(r.y), int(r.x+r.w), int(r.y+r.h))
-	w, h := int(r.w), int(r.h)
-	if w != s.frame.Width || h != s.frame.Height {
-		s.hasFrame = false
-		s.frame = Frame{Pix: make([]byte, w*h*4), Stride: w * 4, Width: w, Height: h}
-	}
 	return nil
 }
 func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
@@ -69,30 +63,35 @@ func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	if s.native == nil {
 		return nil, false, fmt.Errorf("capture closed")
 	}
+	timeout := C.uint(0)
+	if wait > 0 {
+		// Round up sub-millisecond waits and avoid the Windows INFINITE value.
+		ms := wait / time.Millisecond
+		if wait%time.Millisecond != 0 {
+			ms++
+		}
+		if ms > 0xfffffffe {
+			ms = 0xfffffffe
+		}
+		timeout = C.uint(ms)
+	}
+	var image C.capture_image
+	hr := C.capture_frame(s.native, &image, timeout)
+	if hr < 0 {
+		return nil, false, captureError("capture frame", hr)
+	}
 	if err := s.resize(); err != nil {
 		return nil, false, err
 	}
-	timeout := C.uint(wait.Milliseconds())
-	// A new duplication may take a few refreshes to produce its first frame.
-	for attempt := 0; attempt < 64; attempt++ {
-		hr := C.capture_frame(s.native, (*C.uchar)(unsafe.Pointer(&s.frame.Pix[0])), timeout)
-		if hr < 0 {
-			return nil, false, captureError("capture frame", hr)
-		}
-		changed := hr == 0
-		if changed {
-			s.hasFrame = true
-		}
-		// Recreation can change dimensions without producing pixels yet.
-		if err := s.resize(); err != nil {
-			return nil, false, err
-		}
-		if s.hasFrame {
-			return &s.frame, changed, nil
-		}
-		timeout = 16
+	if image.pixels == nil {
+		return nil, false, fmt.Errorf("capture has not produced a frame")
 	}
-	return nil, false, fmt.Errorf("desktop duplication has not produced a frame")
+	w, h, stride := int(image.w), int(image.h), int(image.stride)
+	s.frame = Frame{
+		Pix:    unsafe.Slice((*byte)(unsafe.Pointer(image.pixels)), (h-1)*stride+w*4),
+		Stride: stride, Width: w, Height: h,
+	}
+	return &s.frame, hr == 0, nil
 }
 func (s *windowsSource) Bounds() image.Rectangle {
 	s.mu.Lock()

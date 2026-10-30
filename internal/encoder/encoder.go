@@ -103,6 +103,14 @@ static int enc_encode(enc *e, int64_t pts_ms, int idr, uint8_t **out) {
 	return size;
 }
 
+static int enc_set_bitrate(enc *e, int kbps) {
+	x264_param_t p;
+	x264_encoder_parameters(e->h, &p);
+	p.rc.i_vbv_max_bitrate = kbps;
+	p.rc.i_vbv_buffer_size = kbps / 4;
+	return x264_encoder_reconfig(e->h, &p);
+}
+
 static int enc_last_idr(enc *e) { return e->out.b_keyframe; }
 */
 import "C"
@@ -155,6 +163,15 @@ func New(w, h int, o Options) (*Encoder, error) {
 		return nil, errors.New("encoder: x264_encoder_open failed")
 	}
 	return &Encoder{e: e, w: w, h: h, opts: o}, nil
+}
+
+// SetBitrate changes the VBV ceiling on the fly, e.g. in response to
+// congestion control.
+func (e *Encoder) SetBitrate(kbps int) error {
+	if C.enc_set_bitrate(e.e, C.int(kbps)) < 0 {
+		return errors.New("encoder: x264_encoder_reconfig failed")
+	}
+	return nil
 }
 
 // Size is the encoded frame size.

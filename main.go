@@ -3,12 +3,15 @@
 package main
 
 import (
+	"crypto/sha256"
+	"crypto/subtle"
 	"embed"
 	"flag"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strings"
 
 	"github.com/pion/webrtc/v4"
@@ -31,6 +34,7 @@ func main() {
 		stun      = flag.String("stun", "", "comma-separated STUN/TURN URLs, e.g. stun:stun.l.google.com:19302")
 		nat1to1   = flag.String("nat1to1", "", "comma-separated public IPs to advertise as host candidates")
 		list      = flag.Bool("list", false, "list capturable windows and exit")
+		password  = flag.String("password", os.Getenv("URDP_PASSWORD"), "require this password (HTTP basic auth, any username); defaults to $URDP_PASSWORD")
 	)
 	flag.Parse()
 
@@ -70,5 +74,25 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Printf("urdp listening on http://%s", ln.Addr())
-	log.Fatal(http.Serve(ln, srv))
+	var h http.Handler = srv
+	if *password != "" {
+		h = basicAuth(h, *password)
+	} else {
+		log.Printf("warning: no -password set; anyone who can reach this port controls this machine")
+	}
+	log.Fatal(http.Serve(ln, h))
+}
+
+func basicAuth(next http.Handler, password string) http.Handler {
+	want := sha256.Sum256([]byte(password))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, pw, _ := r.BasicAuth()
+		got := sha256.Sum256([]byte(pw))
+		if subtle.ConstantTimeCompare(got[:], want[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", `Basic realm="urdp"`)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }

@@ -10,11 +10,14 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/interceptor/pkg/cc"
+	"github.com/pion/interceptor/pkg/gcc"
 	"github.com/pion/webrtc/v4"
 
 	"github.com/kevmo314/urdp/internal/audio"
@@ -43,7 +46,6 @@ type Config struct {
 
 type Server struct {
 	cfg Config
-	api *webrtc.API
 	mux *http.ServeMux
 
 	mu        sync.Mutex
@@ -73,11 +75,13 @@ func New(cfg Config) (*Server, error) {
 		cfg.Encoder.FPS = 60
 	}
 
-	api, err := newAPI(cfg)
-	if err != nil {
+	if cfg.Encoder.BitrateKbps <= 0 {
+		cfg.Encoder.BitrateKbps = 20000
+	}
+	if _, _, err := newAPI(cfg); err != nil {
 		return nil, err
 	}
-	s := &Server{cfg: cfg, api: api, mux: http.NewServeMux(), pipelines: map[string]*pipeline{}}
+	s := &Server{cfg: cfg, mux: http.NewServeMux(), pipelines: map[string]*pipeline{}}
 
 	s.mux.HandleFunc("GET /api/windows", s.handleWindows)
 	s.mux.HandleFunc("POST /api/offer", s.handleOffer)
@@ -96,7 +100,9 @@ func New(cfg Config) (*Server, error) {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
-func newAPI(cfg Config) (*webrtc.API, error) {
+// newAPI builds a WebRTC API for one peer connection. It's per connection
+// so the congestion controller's bandwidth estimator can be tied to it.
+func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 	m := &webrtc.MediaEngine{}
 	fb := []webrtc.RTCPFeedback{{Type: "nack"}, {Type: "nack", Parameter: "pli"}, {Type: "ccm", Parameter: "fir"}, {Type: "goog-remb"}, {Type: "transport-cc"}}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
@@ -107,7 +113,7 @@ func newAPI(cfg Config) (*webrtc.API, error) {
 		},
 		PayloadType: 102,
 	}, webrtc.RTPCodecTypeVideo); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
@@ -116,15 +122,35 @@ func newAPI(cfg Config) (*webrtc.API, error) {
 		},
 		PayloadType: 111,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: PlayoutDelayURI}, webrtc.RTPCodecTypeVideo); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	ir := &interceptor.Registry{}
+	maxBps := cfg.Encoder.BitrateKbps * 1000
+	gccFactory, err := cc.NewInterceptor(func() (cc.BandwidthEstimator, error) {
+		// No pacer: smoothing packets out would add queueing delay to
+		// every frame, the opposite of what we want on a LAN.
+		return gcc.NewSendSideBWE(
+			gcc.SendSideBWEInitialBitrate(maxBps),
+			gcc.SendSideBWEMinBitrate(minBitrate),
+			gcc.SendSideBWEMaxBitrate(maxBps),
+			gcc.SendSideBWEPacer(gcc.NewNoOpPacer()),
+		)
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	var bwe cc.BandwidthEstimator
+	gccFactory.OnNewPeerConnection(func(_ string, e cc.BandwidthEstimator) { bwe = e })
+	ir.Add(gccFactory)
+	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, ir); err != nil {
+		return nil, nil, err
+	}
 	if err := webrtc.RegisterDefaultInterceptors(m, ir); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	ir.Add(playoutDelayFactory{})
 
@@ -132,10 +158,14 @@ func newAPI(cfg Config) (*webrtc.API, error) {
 	// Lets a browser on the same machine connect over loopback, which also
 	// works across WSL2/VM boundaries where host-IP UDP is firewalled.
 	se.SetIncludeLoopbackCandidate(true)
+	// Notice dead viewers quickly so they stop consuming encoder and
+	// bandwidth (defaults are 5s disconnected / 25s failed).
+	se.SetICETimeouts(3*time.Second, 6*time.Second, time.Second)
 	if len(cfg.NAT1To1IPs) > 0 {
 		se.SetNAT1To1IPs(cfg.NAT1To1IPs, webrtc.ICECandidateTypeHost)
 	}
-	return webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se)), nil
+	api := webrtc.NewAPI(webrtc.WithMediaEngine(m), webrtc.WithInterceptorRegistry(ir), webrtc.WithSettingEngine(se))
+	return api, func() cc.BandwidthEstimator { return bwe }, nil
 }
 
 func (s *Server) handleWindows(w http.ResponseWriter, r *http.Request) {
@@ -159,7 +189,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	out := map[string]any{}
 	for id, p := range s.pipelines {
-		out[id] = map[string]any{"viewers": p.refs, "stats": p.Stats()}
+		out[id] = map[string]any{"viewers": p.refs, "stats": p.Stats(), "congestion": p.viewerStats()}
 	}
 	s.mu.Unlock()
 	writeJSON(w, out)
@@ -259,14 +289,21 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 	if err != nil {
 		return nil, fmt.Errorf("open source %q: %w", id, err)
 	}
-	pc, err := s.api.NewPeerConnection(webrtc.Configuration{ICEServers: s.cfg.ICEServers})
+	api, bwe, err := newAPI(s.cfg)
 	if err != nil {
 		s.release(p)
 		return nil, err
 	}
+	pc, err := api.NewPeerConnection(webrtc.Configuration{ICEServers: s.cfg.ICEServers})
+	if err != nil {
+		s.release(p)
+		return nil, err
+	}
+	sess := &session{p: p, pc: pc}
 	var closeOnce sync.Once
 	cleanup := func() {
 		closeOnce.Do(func() {
+			p.removeViewer(sess)
 			s.release(p)
 			_ = pc.Close()
 		})
@@ -286,7 +323,9 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription) (*webrtc.
 		go readRTCP(as, nil)
 	}
 
-	sess := &session{p: p, pc: pc}
+	if e := bwe(); e != nil && os.Getenv("URDP_NO_CC") == "" {
+		p.addViewer(sess, e)
+	}
 	if inj := s.injector(); inj != nil {
 		sess.disp = &input.Dispatcher{Inj: inj, Bounds: p.src.Bounds, WindowID: p.src.WindowID()}
 	}

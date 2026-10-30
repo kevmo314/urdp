@@ -1,6 +1,7 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include "native_windows.h"
+#include "wgc_windows.h"
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <dxgi1_2.h>
@@ -16,18 +17,25 @@ struct capture_native {
     IDXGIOutputDuplication *dup;
     ID3D11Texture2D *staging;
     DXGI_MODE_ROTATION rotation;
+    capture_image image;
+    int mapped;
+    unsigned char *rotated;
+    size_t rotated_size;
+    capture_wgc *wgc;
+    unsigned char *metadata;
+    UINT metadata_size;
     HDC dc;
     HBITMAP bitmap;
     HGDIOBJ old;
     unsigned char *pixels;
     int bw, bh;
 };
-#define RELEASE(p) \
-    do { \
-        if (p) { \
-            IUnknown_Release((IUnknown *)(p)); \
-            (p) = NULL; \
-        } \
+#define RELEASE(p)                                                                                 \
+    do {                                                                                           \
+        if (p) {                                                                                   \
+            IUnknown_Release((IUnknown *)(p));                                                     \
+            (p) = NULL;                                                                            \
+        }                                                                                          \
     } while (0)
 void capture_dpi(void) {
     typedef BOOL(WINAPI * dpi_fn)(HANDLE);
@@ -36,7 +44,15 @@ void capture_dpi(void) {
     if (fn)
         fn((HANDLE)(intptr_t)-4);
 }
+static void unmap(capture_native *s) {
+    if (s->mapped) {
+        ID3D11DeviceContext_Unmap(s->context, (ID3D11Resource *)s->staging, 0);
+        s->mapped = 0;
+    }
+}
 static HRESULT desktop_init(capture_native *s) {
+    unmap(s);
+    s->image = (capture_image){0};
     RELEASE(s->staging);
     RELEASE(s->dup);
     RELEASE(s->context);
@@ -77,7 +93,7 @@ static HRESULT desktop_init(capture_native *s) {
     RELEASE(factory);
     return DXGI_ERROR_NOT_FOUND;
 }
-long capture_bounds(capture_native *s, capture_rect *r) {
+static HRESULT window_bounds(capture_native *s) {
     if (s->hwnd) {
         RECT client;
         POINT origin = {0, 0};
@@ -89,7 +105,17 @@ long capture_bounds(capture_native *s, capture_rect *r) {
         if (s->rect.w <= 0 || s->rect.h <= 0)
             return E_FAIL;
     }
+    return S_OK;
+}
+long capture_bounds(capture_native *s, capture_rect *r) {
+    HRESULT hr = window_bounds(s);
+    if (FAILED(hr))
+        return hr;
     *r = s->rect;
+    if (s->hwnd && s->image.pixels) {
+        r->w = s->image.w;
+        r->h = s->image.h;
+    }
     return S_OK;
 }
 long capture_open(uint64_t hwnd, capture_native **out) {
@@ -103,10 +129,17 @@ long capture_open(uint64_t hwnd, capture_native **out) {
         capture_close(s);
         return hr;
     }
+    if (hwnd) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
+                               &s->device, NULL, &s->context);
+        if (SUCCEEDED(hr))
+            capture_wgc_open(s->hwnd, s->device, &s->wgc);
+    }
     *out = s;
     return S_OK;
 }
-static HRESULT window_frame(capture_native *s, unsigned char *dst) {
+static HRESULT window_frame(capture_native *s) {
     int w = s->rect.w, h = s->rect.h;
     if (!IsWindow(s->hwnd))
         return HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
@@ -119,7 +152,9 @@ static HRESULT window_frame(capture_native *s, unsigned char *dst) {
     }
     if (!s->dc)
         return E_FAIL;
+    int changed = 0;
     if (!s->bitmap || w != s->bw || h != s->bh) {
+        changed = 1;
         if (s->bitmap) {
             SelectObject(s->dc, s->old);
             DeleteObject(s->bitmap);
@@ -143,98 +178,217 @@ static HRESULT window_frame(capture_native *s, unsigned char *dst) {
     if (!PrintWindow(s->hwnd, s->dc, 3))
         return E_FAIL;
     GdiFlush();
-    memcpy(dst, s->pixels, (size_t)w * h * 4);
-    for (size_t i = 3; i < (size_t)w * h * 4; i += 4)
-        dst[i] = 255;
-    return S_OK;
+    size_t size = (size_t)w * h * 4;
+    if (size > s->rotated_size) {
+        unsigned char *p = realloc(s->rotated, size);
+        if (!p)
+            return E_OUTOFMEMORY;
+        s->rotated = p;
+        s->rotated_size = size;
+        changed = 1;
+    }
+    // PrintWindow has no update notifications. Compare against the last image.
+    for (size_t i = 3; i < size; i += 4)
+        s->pixels[i] = 255;
+    if (!changed)
+        changed = memcmp(s->rotated, s->pixels, size) != 0;
+    if (changed)
+        memcpy(s->rotated, s->pixels, size);
+    s->image = (capture_image){s->pixels, w * 4, w, h};
+    return changed ? S_OK : S_FALSE;
 }
-long capture_frame(capture_native *s, unsigned char *dst, unsigned int timeout_ms) {
-    if (s->hwnd)
-        return window_frame(s, dst);
-    if (!s->dup) {
-        HRESULT hr = desktop_init(s);
-        return FAILED(hr) ? hr : S_FALSE;
+// Keep the readback mapped until a newer image replaces it. Timeouts retain the
+// previous mapping so keyframes can still encode the last image without a copy.
+static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const D3D11_BOX *box,
+                             const DXGI_OUTDUPL_FRAME_INFO *info) {
+    D3D11_TEXTURE2D_DESC d, desc;
+    ID3D11Texture2D_GetDesc(texture, &d);
+    desc = d;
+    if (box) {
+        desc.Width = box->right - box->left;
+        desc.Height = box->bottom - box->top;
     }
-    DXGI_OUTDUPL_FRAME_INFO info;
-    IDXGIResource *resource = NULL;
-    HRESULT hr = IDXGIOutputDuplication_AcquireNextFrame(s->dup, timeout_ms, &info, &resource);
-    if (hr == DXGI_ERROR_WAIT_TIMEOUT)
-        return S_FALSE;
-    if (hr == DXGI_ERROR_ACCESS_LOST) {
-        hr = desktop_init(s);
-        return FAILED(hr) ? hr : S_FALSE;
+    unmap(s);
+    s->image = (capture_image){0};
+    if (s->staging) {
+        D3D11_TEXTURE2D_DESC old;
+        ID3D11Texture2D_GetDesc(s->staging, &old);
+        if (old.Width != desc.Width || old.Height != desc.Height || old.Format != desc.Format)
+            RELEASE(s->staging);
     }
-    if (FAILED(hr))
-        return hr;
-    // Pointer-only notifications can precede the first actual desktop image.
-    if (!info.LastPresentTime.QuadPart) {
-        RELEASE(resource);
-        IDXGIOutputDuplication_ReleaseFrame(s->dup);
-        return S_FALSE;
-    }
-    ID3D11Texture2D *texture = NULL;
-    hr = IDXGIResource_QueryInterface(resource, &IID_ID3D11Texture2D, (void **)&texture);
-    RELEASE(resource);
-    if (SUCCEEDED(hr) && !s->staging) {
-        D3D11_TEXTURE2D_DESC desc;
-        ID3D11Texture2D_GetDesc(texture, &desc);
+    int full = !s->staging;
+    HRESULT hr = S_OK;
+    if (!s->staging) {
         desc.Usage = D3D11_USAGE_STAGING;
         desc.BindFlags = 0;
         desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         desc.MiscFlags = 0;
         hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, &s->staging);
     }
-    if (SUCCEEDED(hr)) {
+    if (FAILED(hr))
+        return hr;
+    if (box)
+        ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging, 0, 0, 0,
+                                                  0, (ID3D11Resource *)texture, 0, box);
+    else if (!full && info && info->TotalMetadataBufferSize &&
+             (s->rotation == DXGI_MODE_ROTATION_IDENTITY ||
+              s->rotation == DXGI_MODE_ROTATION_UNSPECIFIED)) {
+        if (info->TotalMetadataBufferSize > s->metadata_size) {
+            unsigned char *p = realloc(s->metadata, info->TotalMetadataBufferSize);
+            if (!p)
+                return E_OUTOFMEMORY;
+            s->metadata = p;
+            s->metadata_size = info->TotalMetadataBufferSize;
+        }
+        UINT moves = 0, dirty = 0;
+        hr = IDXGIOutputDuplication_GetFrameMoveRects(
+            s->dup, s->metadata_size, (DXGI_OUTDUPL_MOVE_RECT *)s->metadata, &moves);
+        if (SUCCEEDED(hr))
+            hr = IDXGIOutputDuplication_GetFrameDirtyRects(s->dup, s->metadata_size - moves,
+                                                           (RECT *)(s->metadata + moves), &dirty);
+        if (SUCCEEDED(hr)) {
+            // Read move destinations from the current desktop texture. This also
+            // handles overlapping moves without a temporary CPU image.
+            for (UINT i = 0; i < moves / sizeof(DXGI_OUTDUPL_MOVE_RECT) + dirty / sizeof(RECT);
+                 i++) {
+                UINT count = moves / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+                RECT r = i < count ? ((DXGI_OUTDUPL_MOVE_RECT *)s->metadata)[i].DestinationRect
+                                   : ((RECT *)(s->metadata + moves))[i - count];
+                D3D11_BOX region = {r.left, r.top, 0, r.right, r.bottom, 1};
+                ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging,
+                                                          0, r.left, r.top, 0,
+                                                          (ID3D11Resource *)texture, 0, &region);
+            }
+        } else
+            full = 1; // Metadata is an optimization; a full copy remains correct.
+    } else
+        full = 1;
+    if (full && !box)
         ID3D11DeviceContext_CopyResource(s->context, (ID3D11Resource *)s->staging,
                                          (ID3D11Resource *)texture);
-        D3D11_MAPPED_SUBRESOURCE map;
-        hr = ID3D11DeviceContext_Map(s->context, (ID3D11Resource *)s->staging, 0, D3D11_MAP_READ, 0,
-                                     &map);
-        if (SUCCEEDED(hr)) {
-            D3D11_TEXTURE2D_DESC d;
-            ID3D11Texture2D_GetDesc(texture, &d);
-            for (int y = 0; y < s->rect.h; y++) {
-                if (s->rotation == DXGI_MODE_ROTATION_IDENTITY ||
-                    s->rotation == DXGI_MODE_ROTATION_UNSPECIFIED) {
-                    memcpy(dst + (size_t)y * s->rect.w * 4,
-                           (char *)map.pData + (size_t)y * map.RowPitch, (size_t)s->rect.w * 4);
-                } else
-                    for (int x = 0; x < s->rect.w; x++) {
-                        int sx = x, sy = y;
-                        switch (s->rotation) {
-                        case DXGI_MODE_ROTATION_ROTATE90:
-                            sx = y;
-                            sy = d.Height - 1 - x;
-                            break;
-                        case DXGI_MODE_ROTATION_ROTATE180:
-                            sx = d.Width - 1 - x;
-                            sy = d.Height - 1 - y;
-                            break;
-                        case DXGI_MODE_ROTATION_ROTATE270:
-                            sx = d.Width - 1 - y;
-                            sy = x;
-                            break;
-                        default:
-                            break;
-                        }
-                        memcpy(dst + ((size_t)y * s->rect.w + x) * 4,
-                               (char *)map.pData + (size_t)sy * map.RowPitch + sx * 4, 4);
-                    }
-            }
-            ID3D11DeviceContext_Unmap(s->context, (ID3D11Resource *)s->staging, 0);
-        }
+    D3D11_MAPPED_SUBRESOURCE map;
+    hr = ID3D11DeviceContext_Map(s->context, (ID3D11Resource *)s->staging, 0, D3D11_MAP_READ, 0,
+                                 &map);
+    if (FAILED(hr))
+        return hr;
+    s->mapped = 1;
+    int w = s->rect.w, h = s->rect.h;
+    if (s->rotation == DXGI_MODE_ROTATION_IDENTITY ||
+        s->rotation == DXGI_MODE_ROTATION_UNSPECIFIED) {
+        s->image = (capture_image){map.pData, map.RowPitch, w, h};
+        return S_OK;
     }
+    size_t size = (size_t)w * h * 4;
+    if (size > s->rotated_size) {
+        unsigned char *p = realloc(s->rotated, size);
+        if (!p)
+            return E_OUTOFMEMORY;
+        s->rotated = p;
+        s->rotated_size = size;
+    }
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            int sx = x, sy = y;
+            switch (s->rotation) {
+            case DXGI_MODE_ROTATION_ROTATE90:
+                sx = y;
+                sy = d.Height - 1 - x;
+                break;
+            case DXGI_MODE_ROTATION_ROTATE180:
+                sx = d.Width - 1 - x;
+                sy = d.Height - 1 - y;
+                break;
+            case DXGI_MODE_ROTATION_ROTATE270:
+                sx = d.Width - 1 - y;
+                sy = x;
+                break;
+            default:
+                break;
+            }
+            memcpy(s->rotated + ((size_t)y * w + x) * 4,
+                   (char *)map.pData + (size_t)sy * map.RowPitch + sx * 4, 4);
+        }
+    unmap(s);
+    s->image = (capture_image){s->rotated, w * 4, w, h};
+    return S_OK;
+}
+long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms) {
+    HRESULT hr;
+    if (s->hwnd) {
+        hr = window_bounds(s);
+        if (FAILED(hr))
+            return hr;
+        if (s->wgc) {
+            ID3D11Texture2D *texture = NULL;
+            D3D11_BOX box;
+            hr = capture_wgc_frame(s->wgc, timeout_ms, &texture, &box);
+            if (hr == S_OK) {
+                s->rect.w = box.right - box.left;
+                s->rect.h = box.bottom - box.top;
+                hr = texture_frame(s, texture, &box, NULL);
+            }
+            RELEASE(texture);
+            if (FAILED(hr)) {
+                // A stopped compositor/device must not leave a permanently broken source.
+                capture_wgc_close(s->wgc);
+                s->wgc = NULL;
+                unmap(s);
+                RELEASE(s->staging);
+                s->image = (capture_image){0};
+                hr = window_frame(s);
+            }
+        } else
+            hr = window_frame(s);
+        *image = s->image;
+        return hr;
+    }
+    if (!s->dup) {
+        hr = desktop_init(s);
+        *image = s->image;
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    DXGI_OUTDUPL_FRAME_INFO info;
+    IDXGIResource *resource = NULL;
+    hr = IDXGIOutputDuplication_AcquireNextFrame(s->dup, timeout_ms, &info, &resource);
+    if (hr == DXGI_ERROR_ACCESS_LOST) {
+        hr = desktop_init(s);
+        *image = s->image;
+        return FAILED(hr) ? hr : S_FALSE;
+    }
+    if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+        *image = s->image;
+        return S_FALSE;
+    }
+    if (FAILED(hr))
+        return hr;
+    // Pointer updates do not alter the desktop image (the client draws its cursor).
+    if (!info.LastPresentTime.QuadPart) {
+        RELEASE(resource);
+        IDXGIOutputDuplication_ReleaseFrame(s->dup);
+        *image = s->image;
+        return S_FALSE;
+    }
+    ID3D11Texture2D *texture = NULL;
+    hr = IDXGIResource_QueryInterface(resource, &IID_ID3D11Texture2D, (void **)&texture);
+    RELEASE(resource);
+    if (SUCCEEDED(hr))
+        hr = texture_frame(s, texture, NULL, &info);
     RELEASE(texture);
     IDXGIOutputDuplication_ReleaseFrame(s->dup);
+    *image = s->image;
     return hr;
 }
 void capture_close(capture_native *s) {
     if (!s)
         return;
+    capture_wgc_close(s->wgc);
+    unmap(s);
     RELEASE(s->staging);
     RELEASE(s->dup);
     RELEASE(s->context);
     RELEASE(s->device);
+    free(s->rotated);
+    free(s->metadata);
     if (s->bitmap) {
         SelectObject(s->dc, s->old);
         DeleteObject(s->bitmap);
@@ -285,4 +439,6 @@ long capture_list(capture_window **out, int *count) {
     *count = list.count;
     return S_OK;
 }
-void capture_free(void *p) { free(p); }
+void capture_free(void *p) {
+    free(p);
+}
