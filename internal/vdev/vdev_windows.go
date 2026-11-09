@@ -1,7 +1,7 @@
 package vdev
 
 /*
-#cgo windows LDFLAGS: -lole32 -lsetupapi -ladvapi32 -lmfplat -lmfuuid -static -lstdc++ -static-libgcc -static-libstdc++
+#cgo windows LDFLAGS: -lole32 -lsetupapi -ladvapi32 -static -lstdc++ -static-libgcc -static-libstdc++
 #include <stdlib.h>
 #include "native_windows.h"
 */
@@ -119,13 +119,7 @@ type windowsCamera struct {
 func openCamera() (Camera, error) {
 	var native *C.camera_native
 	if code := C.camera_open(&native); code != 0 {
-		if code == 183 {
-			return nil, errors.New("virtual camera is already in use; close the other urdp camera session or stop OBS Virtual Camera before retrying")
-		}
-		if code == 2 || code == 3 {
-			return nil, fmt.Errorf("%w: run `urdp.exe -install-camera` once as Administrator", ErrUnsupported)
-		}
-		return nil, fmt.Errorf("virtual camera: open (Windows error/HRESULT 0x%08x)", uint32(code))
+		return nil, cameraOpenError(uint32(code))
 	}
 	return &windowsCamera{native: native}, nil
 }

@@ -114,6 +114,8 @@ func (s *Server) receiveCamera(pc *webrtc.PeerConnection, t *webrtc.TrackRemote,
 			}
 			if err := cam.WriteFrame(img); err != nil {
 				log.Printf("viewer camera: %v", err)
+				notify("cam", "The host stopped using your camera: "+err.Error())
+				drain(t)
 				return
 			}
 		}

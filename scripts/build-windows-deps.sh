@@ -50,7 +50,7 @@ fi
 
 # The embedded Windows 11 source uses only system DLLs and a static C++ runtime.
 camera_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../internal/vdev/mfcam" && pwd)"
-if [[ ! -f "$camera_dir/urdpcam.dll" || "$camera_dir/source.cpp" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/shared.h" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/sdk.h" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/attributes.h" -nt "$camera_dir/urdpcam.dll" ]]; then
+if [[ ! -f "$camera_dir/urdpcam.dll" || "$camera_dir/source.cpp" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/shared.h" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/sdk.h" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/attributes.h" -nt "$camera_dir/urdpcam.dll" || "$camera_dir/../camconv/convert.h" -nt "$camera_dir/urdpcam.dll" ]]; then
     x86_64-w64-mingw32-g++ -std=c++17 -O2 -Wall -Wextra -Werror -shared -static -static-libgcc -static-libstdc++ \
         -o "$camera_dir/urdpcam.dll.tmp" "$camera_dir/source.cpp" -lmfplat -lmfuuid -lole32 -ladvapi32 -lksuser -luuid
     mv "$camera_dir/urdpcam.dll.tmp" "$camera_dir/urdpcam.dll"

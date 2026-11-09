@@ -14,6 +14,7 @@
 #include <vector>
 #include <new>
 #include "shared.h"
+#include "../camconv/convert.h"
 #include "sdk.h"
 using Microsoft::WRL::ComPtr;
 #define CHECK(x)                                                                                   \
@@ -145,8 +146,12 @@ class Stream : public IMFMediaStream, public RefCount {
         CHECK(handler->SetCurrentMediaType(types[0].Get()));
         // LocalService can create Global mappings without elevating the writer.
         // Keep the mapping alive for the entire activated source lifetime.
+        // Only SYSTEM, LocalService, Administrators and interactively logged-on
+        // users (the urdp.exe producer) may open it; network logons, services
+        // and AppContainers can't feed frames. Unlabelled objects are Medium
+        // integrity, so Low-IL sandboxed processes can't write either.
         PSECURITY_DESCRIPTOR sd = nullptr;
-        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:(A;;GA;;;WD)",
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:P(A;;GA;;;SY)(A;;GA;;;LS)(A;;GA;;;BA)(A;;GA;;;IU)",
                                                                   SDDL_REVISION_1, &sd, nullptr))
             return HRESULT_FROM_WIN32(GetLastError());
         SECURITY_ATTRIBUTES sa = {sizeof(sa), sd, FALSE};
@@ -198,7 +203,9 @@ class Stream : public IMFMediaStream, public RefCount {
         MemoryBarrier();
         if (sequence & 1)
             return;
-        UINT32 w = slot.width, h = slot.height;
+        // The ring is writable by other processes: read each field exactly once.
+        UINT32 w = *reinterpret_cast<const volatile uint32_t *>(&slot.width);
+        UINT32 h = *reinterpret_cast<const volatile uint32_t *>(&slot.height);
         if (!w || !h || w > URDP_CAMERA_WIDTH || h > URDP_CAMERA_HEIGHT || (w | h) & 1)
             return;
         std::vector<BYTE> frame(w * h * 3 / 2);
@@ -237,25 +244,10 @@ class Stream : public IMFMediaStream, public RefCount {
         CHECK(MFCreateMemoryBuffer(bytes, &buffer));
         BYTE *dst = nullptr;
         CHECK(buffer->Lock(&dst, nullptr, nullptr));
-        if (lastFrame.empty()) {
-            memset(dst, 16, width * height);
-            memset(dst + width * height, 128, width * height / 2);
-        } else {
-            const BYTE *src = lastFrame.data();
-            for (UINT32 y = 0; y < height; y++)
-                for (UINT32 x = 0; x < width; x++)
-                    dst[y * width + x] = src[(uint64_t)y * inputHeight / height * inputWidth +
-                                             (uint64_t)x * inputWidth / width];
-            src += inputWidth * inputHeight;
-            BYTE *uv = dst + width * height;
-            for (UINT32 y = 0; y < height / 2; y++)
-                for (UINT32 x = 0; x < width / 2; x++) {
-                    size_t offset = (uint64_t)y * (inputHeight / 2) / (height / 2) * inputWidth +
-                                    ((uint64_t)x * (inputWidth / 2) / (width / 2)) * 2;
-                    uv[y * width + x * 2] = src[offset];
-                    uv[y * width + x * 2 + 1] = src[offset + 1];
-                }
-        }
+        if (lastFrame.empty())
+            urdp_nv12_black(dst, width, height);
+        else
+            urdp_nv12_fit(dst, width, height, lastFrame.data(), inputWidth, inputHeight);
         CHECK(buffer->Unlock());
         CHECK(buffer->SetCurrentLength(bytes));
         CHECK(sample->AddBuffer(buffer.Get()));

@@ -1,5 +1,6 @@
 #include "mfcam/sdk.h"
 #include "mfcam/shared.h"
+#include "camconv/convert.h"
 #include <mfapi.h>
 #include <mfidl.h>
 #include <new>
@@ -38,7 +39,18 @@ static bool open_ring(camera_native *s) {
 static DWORD WINAPI camera_thread(void *arg) {
     auto *s = static_cast<camera_native *>(arg);
     HRESULT com = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    HRESULT mf = FAILED(com) ? com : MFStartup(MF_VERSION, MFSTARTUP_LITE);
+    // Media Foundation is loaded on demand so urdp.exe still starts on
+    // Windows "N" editions without the Media Feature Pack.
+    HMODULE mfplat = LoadLibraryW(L"mfplat.dll");
+    auto startup = mfplat ? reinterpret_cast<HRESULT(WINAPI *)(ULONG, DWORD)>(
+                                GetProcAddress(mfplat, "MFStartup"))
+                          : nullptr;
+    auto shutdown = mfplat ? reinterpret_cast<HRESULT(WINAPI *)()>(
+                                 GetProcAddress(mfplat, "MFShutdown"))
+                           : nullptr;
+    HRESULT mf = FAILED(com)               ? com
+                 : !startup || !shutdown ? HRESULT_FROM_WIN32(ERROR_MOD_NOT_FOUND)
+                                         : startup(MF_VERSION, MFSTARTUP_LITE);
     HMODULE module = nullptr;
     ComPtr<IMFVirtualCamera> camera;
     s->result = mf;
@@ -73,7 +85,9 @@ static DWORD WINAPI camera_thread(void *arg) {
     if (module)
         FreeLibrary(module);
     if (SUCCEEDED(mf))
-        MFShutdown();
+        shutdown();
+    if (mfplat)
+        FreeLibrary(mfplat);
     if (SUCCEEDED(com))
         CoUninitialize();
     return 0;
@@ -166,20 +180,10 @@ extern "C" void camera_write(camera_native *s, const uint8_t *y, const uint8_t *
     InterlockedExchange(&slot.sequence, slot.sequence | 1);
     slot.width = w;
     slot.height = h;
-    slot.timestamp = MFGetSystemTime();
-    for (int row = 0; row < h; row++) {
-        const BYTE *src = y + (row < height ? row : height - 1) * ys;
-        BYTE *dst = slot.pixels + row * w;
-        memcpy(dst, src, width);
-        if (w > width)
-            dst[width] = src[width - 1];
-    }
-    BYTE *uv = slot.pixels + w * h;
-    for (int row = 0; row < h / 2; row++)
-        for (int col = 0; col < w / 2; col++) {
-            uv[row * w + 2 * col] = u[row * us + col];
-            uv[row * w + 2 * col + 1] = v[row * vs + col];
-        }
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    slot.timestamp = now.QuadPart; // informational; the source stamps samples itself
+    urdp_i420_to_nv12(slot.pixels, y, u, v, width, height, ys, us, vs);
     InterlockedIncrement(&slot.sequence);
     InterlockedExchange(&s->ring->counter, counter);
 }
