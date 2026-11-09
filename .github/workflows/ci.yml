@@ -57,12 +57,12 @@ jobs:
       - name: Check formatting
         run: test -z "$(gofmt -l .)"
       - name: Test
-        run: xvfb-run -a -s "-screen 0 1280x720x24" go test -race ./...
+        run: xvfb-run -a -s "-screen 0 1280x720x24 -noreset" go test -race ./...
       - name: Build
         run: go build -o urdp .
       - name: End-to-end latency (Chrome)
         run: |
-          Xvfb :99 -screen 0 1920x1080x24 &
+          Xvfb :99 -screen 0 1920x1080x24 -noreset &
           sleep 1
           DISPLAY=:99 ./urdp -addr 127.0.0.1:8000 -audio 0 &
           sleep 1
