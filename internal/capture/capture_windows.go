@@ -95,6 +95,12 @@ func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	default:
 		return nil, false, fmt.Errorf("capture has not produced a frame")
 	}
+	if image.present > 0 {
+		// Convert from the QueryPerformanceCounter clock to Go's.
+		if age := time.Duration(C.capture_now_100ns()-image.present) * 100; age >= 0 && age < time.Second {
+			s.frame.Time = time.Now().Add(-age)
+		}
+	}
 	return &s.frame, hr == 0, nil
 }
 

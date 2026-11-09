@@ -31,7 +31,11 @@ typedef struct {
     unsigned char *pixels;
     int stride, w, h;
     void *texture, *device;
+    // When the frame was put on screen, in 100ns units of the
+    // QueryPerformanceCounter clock (capture_now_100ns); 0 if unknown.
+    int64_t present;
 } capture_image;
+int64_t capture_now_100ns(void);
 // capture_set_gpu switches between CPU frames and GPU textures. It returns
 // whether GPU mode is now on: it is refused when monitors span adapters.
 // Rotated monitors and fallback paths still produce CPU frames.

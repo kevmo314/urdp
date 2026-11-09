@@ -26,6 +26,10 @@ type Frame struct {
 	// may then be nil, so encoders that don't must not be paired with a
 	// source that omits Pix.
 	GPU any
+	// Time is when the frame was put on screen, if the platform reports it
+	// (zero otherwise). Stamping frames with it rather than with when they
+	// were grabbed keeps the receiver's playout cadence true to the host's.
+	Time time.Time
 }
 
 // Source produces frames from the desktop or a single window.

@@ -105,7 +105,7 @@ type pipelineStats struct {
 // frameCounts tallies the fate of each pass through the pipeline loop.
 type frameCounts struct {
 	Captures, Unchanged, CaptureErrors, EncodeErrors, Empty, Sent int
-	// Spread of the time between sent frames, in ms.
+	// Spread of the time between sent frames' timestamps, in ms.
 	SendIntervalMs, SendIntervalStdMs float64
 	sum, sq                           float64
 }
@@ -154,7 +154,7 @@ func (p *pipeline) run() {
 	packetizer := rtp.NewPacketizer(1200, 0, 0, lookupCodec(p.codec).payloader(), rtp.NewRandomSequencer(), 90000)
 	tsBase := rand.Uint32()
 	var counts, rates frameCounts
-	var lastSent time.Time
+	var lastStamp time.Time
 	countStart := time.Now()
 	tally := func() {
 		if time.Since(countStart) >= time.Second {
@@ -283,15 +283,25 @@ func (p *pipeline) run() {
 			counts.Empty++
 			continue
 		}
-		if !lastSent.IsZero() && counts.Sent > 0 {
-			d := float64(t0.Sub(lastSent).Microseconds()) / 1000
+		counts.Sent++
+		sentBytes += len(data)
+		// Stamp the frame with when it was on screen when the source says
+		// (the grab can lag that by up to an interval of pacing), kept
+		// increasing.
+		stamp := t0
+		if !f.Time.IsZero() && f.Time.Before(t0) && t0.Sub(f.Time) < time.Second {
+			stamp = f.Time
+		}
+		if !stamp.After(lastStamp) {
+			stamp = lastStamp.Add(time.Millisecond)
+		}
+		if !lastStamp.IsZero() && counts.Sent > 1 {
+			d := float64(stamp.Sub(lastStamp).Microseconds()) / 1000
 			counts.sum += d
 			counts.sq += d * d
 		}
-		lastSent = t0
-		counts.Sent++
-		sentBytes += len(data)
-		ts := tsBase + uint32(t0.Sub(start)*90000/time.Second)
+		lastStamp = stamp
+		ts := tsBase + uint32(stamp.Sub(start)*90000/time.Second)
 		for _, pkt := range packetizer.Packetize(data, 0) {
 			pkt.Timestamp = ts
 			// An error means some viewer failed; keep going so the others

@@ -173,7 +173,7 @@ extern "C" HRESULT capture_wgc_open(HWND hwnd, ID3D11Device *device, capture_wgc
     *out = s;
     return S_OK;
 }
-extern "C" HRESULT capture_wgc_frame(capture_wgc *s, unsigned int timeout_ms,
+extern "C" HRESULT capture_wgc_frame(capture_wgc *s, unsigned int timeout_ms, int64_t *present,
                                      ID3D11Texture2D **texture, D3D11_BOX *box) {
     Apartment apartment;
     if (FAILED(apartment.hr))
@@ -224,6 +224,8 @@ extern "C" HRESULT capture_wgc_frame(capture_wgc *s, unsigned int timeout_ms,
     }
     ComPtr<D3D::IDirect3DSurface> surface;
     ComPtr<DxgiAccess> access;
+    ABI::Windows::Foundation::TimeSpan when{};
+    *present = SUCCEEDED(frame->get_SystemRelativeTime(&when)) ? when.Duration : 0;
     if (SUCCEEDED(hr))
         hr = frame->get_Surface(&surface);
     if (SUCCEEDED(hr))

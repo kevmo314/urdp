@@ -37,6 +37,7 @@ struct capture_native {
     // so their textures can be composited on the GPU.
     ID3D11Device *shared;
     ID3D11Query *done; // signals when queued GPU copies have finished
+    int64_t present;   // when the current image was put on screen (capture_now_100ns clock)
     unsigned char *metadata;
     UINT metadata_size;
     HDC dc;
@@ -53,6 +54,17 @@ struct capture_native {
         }                                                                                          \
     } while (0)
 #define HAS_IMAGE(s) ((s)->image.pixels || (s)->image.texture)
+static int64_t qpc_to_100ns(int64_t qpc) {
+    static LARGE_INTEGER freq;
+    if (!freq.QuadPart)
+        QueryPerformanceFrequency(&freq);
+    return qpc / freq.QuadPart * 10000000 + qpc % freq.QuadPart * 10000000 / freq.QuadPart;
+}
+int64_t capture_now_100ns(void) {
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return qpc_to_100ns(now.QuadPart);
+}
 // gpu_wait blocks until the GPU has executed every command queued so far.
 // A copy out of a Desktop Duplication surface must finish before
 // ReleaseFrame hands the surface back to DWM, or it can read the next
@@ -337,6 +349,7 @@ long capture_open(uint64_t hwnd, capture_native **out) {
 }
 static HRESULT gdi_frame(capture_native *s) {
     int w = s->rect.w, h = s->rect.h;
+    s->present = capture_now_100ns();
     if (s->hwnd && !IsWindow(s->hwnd))
         return HRESULT_FROM_WIN32(ERROR_INVALID_WINDOW_HANDLE);
     if (!s->dc) {
@@ -567,7 +580,13 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     return S_OK;
 }
 static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms);
+static long frame(capture_native *s, capture_image *image, unsigned int timeout_ms);
 long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms) {
+    long hr = frame(s, image, timeout_ms);
+    image->present = s->present;
+    return hr;
+}
+static long frame(capture_native *s, capture_image *image, unsigned int timeout_ms) {
     if (s->outputs) {
         HRESULT hr = composite_frame(s, timeout_ms);
         *image = s->image;
@@ -583,8 +602,10 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
         if (s->wgc) {
             ID3D11Texture2D *texture = NULL;
             D3D11_BOX box;
-            hr = capture_wgc_frame(s->wgc, timeout_ms, &texture, &box);
+            int64_t present = 0;
+            hr = capture_wgc_frame(s->wgc, timeout_ms, &present, &texture, &box);
             if (hr == S_OK) {
+                s->present = present ? present : capture_now_100ns();
                 s->rect.w = box.right - box.left;
                 s->rect.h = box.bottom - box.top;
                 hr = texture_frame(s, texture, &box, NULL);
@@ -644,6 +665,8 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
     RELEASE(resource);
     if (SUCCEEDED(hr))
         hr = texture_frame(s, texture, NULL, &info);
+    if (SUCCEEDED(hr))
+        s->present = qpc_to_100ns(info.LastPresentTime.QuadPart);
     RELEASE(texture);
     IDXGIOutputDuplication_ReleaseFrame(s->dup);
     *image = s->image;
@@ -714,6 +737,8 @@ static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms) {
                 changed = 1;
             }
             // A timeout retains the same pixels; full_update is cleared after use.
+            if ((o->full_update || o->move_bytes || o->dirty_bytes) && o->present > s->present)
+                s->present = o->present;
             if (o->full_update) {
                 composite_copy(s, o, (RECT){0, 0, o->rect.w, o->rect.h}, 0);
                 changed = 1;

@@ -36,6 +36,11 @@ func TestGPUOutput(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				// The presentation time is in the past, and recent unless
+				// the screen has been idle.
+				if f.Time.IsZero() || f.Time.After(time.Now()) {
+					t.Fatalf("frame time %v (now %v)", f.Time, time.Now())
+				}
 				if f.Width != b.Dx() || f.Height != b.Dy() {
 					t.Fatalf("frame %dx%d, bounds %v", f.Width, f.Height, b)
 				}
