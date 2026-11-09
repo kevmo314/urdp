@@ -193,6 +193,9 @@ func (e *x264Encoder) Encode(f *capture.Frame, ptsMs int64, keyframe bool) ([]by
 	if f.Width < e.w || f.Height < e.h {
 		return nil, false, errors.New("encoder: frame smaller than encoder")
 	}
+	if len(f.Pix) < f.Stride*(e.h-1)+e.w*4 {
+		return nil, false, errors.New("encoder: frame has no CPU pixels")
+	}
 	if e.primed && f.Dirty != nil {
 		e.convertDirty(f)
 	} else {

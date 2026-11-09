@@ -189,7 +189,23 @@ func (p *pipeline) run() {
 				enc = nil
 				continue
 			}
+			// Let capture hand over GPU frames (zero-copy) only once the
+			// backend that will take them is open, so a software fallback
+			// keeps getting CPU pixels. The current frame stays valid.
+			if src, ok := p.src.(interface{ SetGPUOutput(bool) error }); ok {
+				// On failure capture keeps its old format: GPU-capable
+				// encoders take CPU frames too, and GPU-only frames are
+				// skipped below for the rest.
+				if err := src.SetGPUOutput(acceptsGPU(enc)); err != nil {
+					log.Printf("source %s: capture format: %v", p.id, err)
+				}
+			}
 			p.keyframe.Store(true)
+		}
+		// Right after switching back from GPU output the source may still
+		// hold a GPU-only frame; wait for the next one.
+		if f.Pix == nil && !acceptsGPU(enc) {
+			continue
 		}
 		if elapsed := t1.Sub(lastRate); elapsed >= 250*time.Millisecond {
 			sent := int(float64(sentBytes*8) / elapsed.Seconds())
@@ -231,6 +247,12 @@ func (p *pipeline) run() {
 		}
 		p.statsMu.Unlock()
 	}
+}
+
+// acceptsGPU reports whether enc encodes capture.Frame.GPU handles directly.
+func acceptsGPU(enc encoder.Encoder) bool {
+	g, ok := enc.(interface{ AcceptsGPUFrames() bool })
+	return ok && g.AcceptsGPUFrames()
 }
 
 func (p *pipeline) Stats() pipelineStats {

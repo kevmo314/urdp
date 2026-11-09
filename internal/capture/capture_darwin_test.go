@@ -82,6 +82,31 @@ func TestDarwinScreenCapture(t *testing.T) {
 			}
 		}
 		t.Logf("%s: %dx%d pixels; bounds %v; Capture(0) average %v", source, f.Width, f.Height, s.Bounds(), time.Since(start)/100)
+		if gpu, ok := s.(interface{ SetGPUOutput(bool) error }); ok {
+			for _, enabled := range []bool{true, false} {
+				if err := gpu.SetGPUOutput(enabled); err != nil {
+					t.Fatal(err)
+				}
+				// Until the screen changes, the frame from before the switch
+				// is returned in its old format; each frame must be exactly
+				// one of the two.
+				switched := false
+				for deadline := time.Now().Add(3 * time.Second); !switched && time.Now().Before(deadline); {
+					f, _, err := s.Capture(100 * time.Millisecond)
+					if err != nil {
+						t.Fatal(err)
+					}
+					pixel, gpu := f.GPU.(DarwinPixelBuffer)
+					if gpu == (len(f.Pix) != 0) || (gpu && pixel.Pointer == nil) {
+						t.Fatalf("frame has GPU=%v and %d CPU bytes", gpu, len(f.Pix))
+					}
+					switched = gpu == enabled
+				}
+				if !switched {
+					t.Logf("%s: no frame in the new format (GPU=%v) within 3s; still screen?", source, enabled)
+				}
+			}
+		}
 		if err = s.Close(); err != nil {
 			t.Fatal(err)
 		}

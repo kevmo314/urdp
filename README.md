@@ -44,7 +44,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Desktop capture | XShm on the root window (cropped per monitor via XRandR) | DXGI Desktop Duplication per output, stitched, dirty rects only | ScreenCaptureKit per display, stitched |
 | Window capture | XComposite-redirected window + XShm | Windows.Graphics.Capture (PrintWindow fallback) | ScreenCaptureKit window filter |
 | Change detection | XDamage | DXGI / WGC frame events | SCFrameStatus |
-| Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | libx264 (static) | libx264 (static) |
+| Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | libx264 (static) | VideoToolbox H.264/HEVC; libx264 fallback (static) |
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
 | Cursor shape | XFixes events | GetCursorInfo at 60 Hz | NSCursor.currentSystemCursor at 60 Hz |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
@@ -157,6 +157,12 @@ Then restart urdp.
 
 - **Microphone.** urdp carries its own CoreAudio driver (an AudioServerPlugIn, ad-hoc signed, built by `make mac`). Install it once with `sudo ./urdp -install-audio-driver`. This copies `urdp-audio.driver` into `/Library/Audio/Plug-Ins/HAL` and restarts `coreaudiod`, which interrupts audio for a moment. Apps then list an input called "urdp Microphone" (48kHz stereo). The device is a loopback: urdp plays the viewer's microphone into its output side, and apps record its input side. Because of that, it also shows up in the output list, but it never becomes the default output. To remove it, run `sudo rm -rf /Library/Audio/Plug-Ins/HAL/urdp-audio.driver && sudo killall coreaudiod`. Apps that record from it need the usual Microphone permission.
 - **Camera and gamepad.** These aren't possible without Apple-issued signing. A virtual camera must be a CoreMediaIO camera extension, and macOS only activates a system extension from an app signed with a Developer ID and the system extension entitlement. The older DAL plug-ins no longer load. A virtual gamepad needs `IOHIDUserDevice`, which requires the restricted `com.apple.developer.hid.virtual.device` entitlement. Without it, creation fails even as root, and an ad-hoc signed binary that claims the entitlement is killed at launch.
+
+VideoToolbox hardware H.264 (`vt-h264`) and HEVC (`vt-hevc`) are registered only when the hardware encoder probe succeeds. Both run in real time with frame reordering off, no frame delay, and speed prioritized over quality, and each `Encode` waits for that frame's own output before returning Annex B (about 7 ms for 1080p H.264 and 5 ms for HEVC on an M1). Bitrate changes apply on the next frame: they set the average, with a hard limit of 1.5x over any second. Apple's low-latency rate control mode isn't used. On an M1 it ignored the rate limit for keyframes and then dropped most frames to catch up. M1 has no AV1 hardware encoder.
+
+For a single display or window, the pipeline switches ScreenCaptureKit to IOSurface-backed NV12 (BT.709 matrix, sRGB color space) and hands its retained CVPixelBuffer directly to VideoToolbox without a CPU readback or color conversion. Stitched desktops use BGRA and the shared NV12 converter; software fallback keeps BGRA capture.
+
+`go test -v ./internal/encoder -run TestVideoToolbox` checks 1080p CPU and synthetic IOSurface input, the session's low-latency properties, keyframes exactly when forced or at the interval, parameter sets, one output per input, and live bitrate changes. Install `ffmpeg` to also verify that each decoded frame matches its input and that the stream signals BT.709 with no B-frames. `go test -v ./internal/server -run TestVideoToolboxWebRTC` checks H.264 and H.265 negotiation and packet flow with a Mac-local Pion client; set `URDP_TEST_SERVER_URL=http://127.0.0.1:8000` to test a separately running server using its synthetic `test` source. Live capture tests require `URDP_TEST_SCREEN=1` and Screen Recording permission.
 
 ### Networking notes
 

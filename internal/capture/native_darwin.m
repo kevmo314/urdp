@@ -51,6 +51,8 @@ void ur_wait(uint64_t previous, double seconds) {
 @property SCStreamConfiguration *configuration;
 @property CGFloat scale;
 @property BOOL closed;
+@property BOOL gpu;
+@property BOOL heldLocked;
 @end
 @implementation URCapture
 - (void)stream:(SCStream *)stream didStopWithError:(NSError *)error {
@@ -75,6 +77,12 @@ void ur_wait(uint64_t previous, double seconds) {
   if (!pixel)
     return;
   [self.condition lock];
+  OSType expected = self.gpu ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                             : kCVPixelFormatType_32BGRA;
+  if (CVPixelBufferGetPixelFormatType(pixel) != expected) {
+    [self.condition unlock];
+    return;
+  }
   if (self.pending)
     CVPixelBufferRelease(self.pending);
   self.pending = self.closed ? NULL : CVPixelBufferRetain(pixel);
@@ -250,6 +258,10 @@ void *ur_open(uint32_t window, int display, char **err) {
     cfg.minimumFrameInterval = CMTimeMake(1, 120);
     cfg.queueDepth = 3;
     cfg.pixelFormat = kCVPixelFormatType_32BGRA;
+    // Encoders tag BT.709 (sRGB primaries); have SCK convert to sRGB and, in
+    // NV12 mode, use the BT.709 matrix so GPU frames match the CPU path.
+    cfg.colorSpaceName = kCGColorSpaceSRGB;
+    cfg.colorMatrix = kCGDisplayStreamYCbCrMatrix_ITU_R_709_2;
     cfg.showsCursor = NO;
     s.configuration = cfg;
     s.stream = [[SCStream alloc] initWithFilter:filter
@@ -281,9 +293,54 @@ void *ur_open(uint32_t window, int display, char **err) {
     return (__bridge_retained void *)s;
   }
 }
+int ur_gpu_output(void *ptr, int enabled, char **err) {
+  @autoreleasepool {
+    URCapture *s = (__bridge URCapture *)ptr;
+    [s.condition lock];
+    if (s.gpu == (BOOL)enabled) {
+      [s.condition unlock];
+      return 0;
+    }
+    s.gpu = enabled;
+    // Drop a pending frame in the old format, but keep the held one: SCK
+    // only delivers frames when the screen changes, so on a still screen it
+    // is all we have until then. ur_frame exposes each buffer by its own
+    // format, and the VideoToolbox encoder takes either.
+    if (s.pending) {
+      CVPixelBufferRelease(s.pending);
+      s.pending = NULL;
+    }
+    // NV12 requires even dimensions, matching encoder normalization.
+    if (enabled) {
+      s.configuration.width = MAX(2, s.configuration.width & ~(size_t)1);
+      s.configuration.height = MAX(2, s.configuration.height & ~(size_t)1);
+    }
+    s.configuration.pixelFormat =
+        enabled ? kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+                : kCVPixelFormatType_32BGRA;
+    [s.condition unlock];
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    __block NSError *failure;
+    [s.stream updateConfiguration:s.configuration
+                completionHandler:^(NSError *error) {
+                  failure = error;
+                  dispatch_semaphore_signal(sem);
+                }];
+    if (dispatch_semaphore_wait(
+            sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC))) {
+      *err = strdup("ScreenCaptureKit format change timed out");
+      return -1;
+    }
+    if (failure) {
+      *err = strdup(failure.localizedDescription.UTF8String);
+      return -1;
+    }
+    return 0;
+  }
+}
 // Returns -2 when a window disappears, -1 on error, 0 on timeout, 1 on change.
-int ur_frame(void *ptr, double wait, void **pixels, int *width, int *height,
-             int *stride, double *bounds, char **err) {
+int ur_frame(void *ptr, double wait, void **pixels, void **gpu, int *width,
+             int *height, int *stride, double *bounds, char **err) {
   @autoreleasepool {
     URCapture *s = (__bridge URCapture *)ptr;
     if (s.windowID) {
@@ -302,6 +359,11 @@ int ur_frame(void *ptr, double wait, void **pixels, int *width, int *height,
           s.scale = scale;
           s.configuration.width = MAX(1, ceil(r.size.width * s.scale));
           s.configuration.height = MAX(1, ceil(r.size.height * s.scale));
+          if (s.gpu) {
+            s.configuration.width = MAX(2, s.configuration.width & ~(size_t)1);
+            s.configuration.height =
+                MAX(2, s.configuration.height & ~(size_t)1);
+          }
           [s.stream updateConfiguration:s.configuration
                       completionHandler:^(NSError *error) {
                         if (error)
@@ -324,22 +386,35 @@ int ur_frame(void *ptr, double wait, void **pixels, int *width, int *height,
     BOOL changed = s.pending != NULL;
     if (changed) {
       if (s.held) {
-        CVPixelBufferUnlockBaseAddress(s.held, kCVPixelBufferLock_ReadOnly);
+        if (s.heldLocked)
+          CVPixelBufferUnlockBaseAddress(s.held, kCVPixelBufferLock_ReadOnly);
+        s.heldLocked = NO;
         CVPixelBufferRelease(s.held);
       }
       s.held = s.pending;
       s.pending = NULL;
-      if (CVPixelBufferLockBaseAddress(s.held, kCVPixelBufferLock_ReadOnly) !=
-          kCVReturnSuccess) {
-        CVPixelBufferRelease(s.held);
-        s.held = NULL;
-        *err = strdup("ScreenCaptureKit pixel buffer could not be locked");
-        [s.condition unlock];
-        return -1;
-      }
     }
     if (s.held) {
-      *pixels = CVPixelBufferGetBaseAddress(s.held);
+      // NV12 stays on the GPU: hand over the IOSurface-backed buffer.
+      // BGRA is locked for CPU reads.
+      if (CVPixelBufferGetPixelFormatType(s.held) ==
+          kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange) {
+        *gpu = s.held;
+      } else {
+        if (!s.heldLocked) {
+          if (CVPixelBufferLockBaseAddress(s.held,
+                                           kCVPixelBufferLock_ReadOnly) !=
+              kCVReturnSuccess) {
+            CVPixelBufferRelease(s.held);
+            s.held = NULL;
+            *err = strdup("ScreenCaptureKit pixel buffer could not be locked");
+            [s.condition unlock];
+            return -1;
+          }
+          s.heldLocked = YES;
+        }
+        *pixels = CVPixelBufferGetBaseAddress(s.held);
+      }
       *width = (int)CVPixelBufferGetWidth(s.held);
       *height = (int)CVPixelBufferGetHeight(s.held);
       *stride = (int)CVPixelBufferGetBytesPerRow(s.held);
@@ -373,7 +448,9 @@ void ur_close(void *ptr) {
       s.pending = NULL;
     }
     if (s.held) {
-      CVPixelBufferUnlockBaseAddress(s.held, kCVPixelBufferLock_ReadOnly);
+      if (s.heldLocked)
+        CVPixelBufferUnlockBaseAddress(s.held, kCVPixelBufferLock_ReadOnly);
+      s.heldLocked = NO;
       CVPixelBufferRelease(s.held);
       s.held = NULL;
     }
