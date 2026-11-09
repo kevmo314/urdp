@@ -46,8 +46,6 @@ type Config struct {
 	AudioKbps int
 	// ICEServers are passed to the peer connection (e.g. STUN for NAT).
 	ICEServers []webrtc.ICEServer
-	// DisableMCP turns off the /mcp endpoint for AI agents.
-	DisableMCP bool
 	// AllowedHosts are hostnames (besides IPs and localhost) the server may
 	// be reached by, e.g. "desktop.example.com". See allowedRequest.
 	AllowedHosts []string
@@ -129,17 +127,16 @@ func New(cfg Config) (*Server, error) {
 	}
 	s := &Server{cfg: cfg, mux: http.NewServeMux(), pipelines: map[string]*pipeline{}}
 
-	if !cfg.DisableMCP {
-		h := agent.Handler(agent.Deps{
-			OpenSource:   cfg.OpenSource,
-			ListWindows:  cfg.ListWindows,
-			ListDisplays: cfg.ListDisplays,
-			Injector:     s.injector,
-		})
-		// Per method, so the patterns don't conflict with "GET /".
-		for _, m := range []string{"GET", "POST", "DELETE"} {
-			s.mux.Handle(m+" /mcp", h)
-		}
+	h := agent.Handler(agent.Deps{
+		OpenSource:   cfg.OpenSource,
+		ListWindows:  cfg.ListWindows,
+		ListDisplays: cfg.ListDisplays,
+		Injector:     s.injector,
+	})
+	// Per method, so the patterns don't conflict with "GET /".
+	for _, m := range []string{"GET", "POST", "DELETE"} {
+		s.mux.Handle(m+" /mcp", h)
+
 	}
 	s.mux.HandleFunc("GET /api/info", s.handleInfo)
 	s.mux.HandleFunc("GET /api/displays", s.handleDisplays)
@@ -230,6 +227,17 @@ func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 	var bwe cc.BandwidthEstimator
 	gccFactory.OnNewPeerConnection(func(_ string, e cc.BandwidthEstimator) { bwe = e })
 	ir.Add(gccFactory)
+	// FlexFEC lets the viewer rebuild lost video packets without waiting
+	// a round trip for a retransmission. Added before transport-cc so the
+	// repair packets it generates aren't rewritten.
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{MimeType: webrtc.MimeTypeFlexFEC03, ClockRate: 90000, SDPFmtpLine: "repair-window=10000000"},
+		PayloadType:        FlexFECPayloadType,
+	}, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, nil, err
+	}
+	ir.Add(frameFECFactory{})
+
 	if err := webrtc.ConfigureTWCCHeaderExtensionSender(m, ir); err != nil {
 		return nil, nil, err
 	}
