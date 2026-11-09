@@ -30,8 +30,11 @@ static int setup_d3d11(AVCodecContext *c, void *device, int w, int h) {
 	fc->sw_format = AV_PIX_FMT_BGRA;
 	fc->width = w;
 	fc->height = h;
-	// One frame is in flight at a time; a few spare slots cost little.
-	fc->initial_pool_size = 4;
+	// Separate textures, not FFmpeg's default texture array: AMF reads
+	// BGRA array slices with the wrong layout (32-row blocks swapped in
+	// pairs). initial_pool_size 0 makes the pool allocate one texture per
+	// frame, as needed; only one or two are ever in use.
+	fc->initial_pool_size = 0;
 	((AVD3D11VAFramesContext *)fc->hwctx)->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
 	if ((r = av_hwframe_ctx_init(frames)) < 0) { av_buffer_unref(&frames); av_buffer_unref(&dev); return r; }
 	c->pix_fmt = AV_PIX_FMT_D3D11;

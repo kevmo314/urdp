@@ -132,7 +132,7 @@ make windows    # builds codecs and camera source, then bin/urdp.exe
 - **AMD AMF** (`libav-h264_amf`, `libav-hevc_amf`, `libav-av1_amf`) is tested and used automatically. H.264 tops out at 4096 pixels wide, so a wider desktop falls back to x264 (use H.265). RDNA3's AV1 encoder pads widths to a multiple of 64, which WebRTC can't crop, so it is refused at those sizes.
 - **NVENC and Media Foundation** (`libav-h264_nvenc`, `libav-hevc_nvenc`, `libav-av1_nvenc`, `libav-h264_mf`, `libav-hevc_mf`) haven't been tested on real hardware yet, so they're only used when named with `-encoder`.
 
-`go test -tags libav ./internal/encoder -run TestLibavD3D11` with `URDP_TEST_ENCODER=h264_amf` (and `WSLENV=URDP_TEST_ENCODER` when running from WSL) encodes a texture through the GPU path and the CPU path; `URDP_TEST_DUMP` saves the streams for checking colors with a decoder.
+`go test -tags libav ./internal/encoder -run TestLibavD3D11` with `URDP_TEST_ENCODER=h264_amf` (and `WSLENV=URDP_TEST_ENCODER` when running from WSL) encodes a texture through the GPU path and the CPU path; `URDP_TEST_DUMP` saves the streams for checking colors with a decoder. `-run TestLibavD3D11Moving` encodes content that changes on every row and every frame (`URDP_TEST_SIZE=3440x1440` to pick a size); check the dumps with `scripts/check-moving.py <dump> h264 <WxH>`. FFmpeg's default D3D11 texture array is avoided: AMF reads BGRA array slices with 32-row blocks swapped.
 
 On Windows x64, run `urdp.exe -install-drivers` once. It requests elevation once,
 installs bundled Microsoft-signed gamepad/USB-IP drivers, and prints whether a

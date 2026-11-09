@@ -36,6 +36,7 @@ struct capture_native {
     // Monitors of a composite on the parent's adapter share its device,
     // so their textures can be composited on the GPU.
     ID3D11Device *shared;
+    ID3D11Query *done; // signals when queued GPU copies have finished
     unsigned char *metadata;
     UINT metadata_size;
     HDC dc;
@@ -52,6 +53,22 @@ struct capture_native {
         }                                                                                          \
     } while (0)
 #define HAS_IMAGE(s) ((s)->image.pixels || (s)->image.texture)
+// gpu_wait blocks until the GPU has executed every command queued so far.
+// A copy out of a Desktop Duplication surface must finish before
+// ReleaseFrame hands the surface back to DWM, or it can read the next
+// frame half-drawn. (The CPU path got this for free from Map.)
+static void gpu_wait(ID3D11Device *device, ID3D11DeviceContext *context, ID3D11Query **query) {
+    if (!*query) {
+        D3D11_QUERY_DESC desc = {D3D11_QUERY_EVENT, 0};
+        if (FAILED(ID3D11Device_CreateQuery(device, &desc, query)))
+            return;
+    }
+    ID3D11DeviceContext_End(context, (ID3D11Asynchronous *)*query);
+    BOOL finished = FALSE;
+    while (ID3D11DeviceContext_GetData(context, (ID3D11Asynchronous *)*query, &finished,
+                                       sizeof(finished), 0) == S_FALSE)
+        SwitchToThread();
+}
 // Hardware encoders use the device from their own threads.
 static void protect(ID3D11Device *device) {
     ID3D10Multithread *mt = NULL;
@@ -485,6 +502,7 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
         ID3D11DeviceContext_CopyResource(s->context, dst, (ID3D11Resource *)texture);
     s->full_update = full || box != NULL;
     if (gpu) {
+        gpu_wait(s->device, s->context, &s->done);
         s->image = (capture_image){NULL, 0, s->rect.w, s->rect.h, s->gpu, s->device};
         return S_OK;
     }
@@ -738,6 +756,7 @@ void capture_close(capture_native *s) {
     unmap(s);
     RELEASE(s->staging);
     RELEASE(s->gpu);
+    RELEASE(s->done);
     RELEASE(s->dup);
     RELEASE(s->context);
     RELEASE(s->device);

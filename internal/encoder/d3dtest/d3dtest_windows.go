@@ -32,6 +32,14 @@ static long pattern(int w, int h, const unsigned char *bgra, void **device, void
 	return 0;
 }
 static void release(void *p) { if (p) IUnknown_Release((IUnknown *)p); }
+// update rewrites the texture through the device's immediate context, as
+// capture does with CopySubresourceRegion.
+static void update(void *device, void *texture, int w, const unsigned char *bgra) {
+	ID3D11DeviceContext *c = NULL;
+	ID3D11Device_GetImmediateContext((ID3D11Device *)device, &c);
+	ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)texture, 0, NULL, bgra, (UINT)w * 4, 0);
+	ID3D11DeviceContext_Release(c);
+}
 */
 import "C"
 
@@ -57,6 +65,11 @@ func New(w, h int, bgra []byte) (*Texture, error) {
 		return nil, fmt.Errorf("d3dtest: HRESULT 0x%08x", uint32(hr))
 	}
 	return &Texture{Device: d, Texture: t}, nil
+}
+
+// Update replaces the texture's pixels (w x h BGRA).
+func (t *Texture) Update(w int, bgra []byte) {
+	C.update(t.Device, t.Texture, C.int(w), (*C.uchar)(unsafe.Pointer(&bgra[0])))
 }
 
 func (t *Texture) Close() {
