@@ -67,9 +67,9 @@ async function negotiate(pc) {
   pc.ontrack = (e) => {
     // Render frames as soon as they decode instead of buffering for
     // smoothness; this is the single biggest client-side latency knob.
-    // In smooth mode, buffer both tracks by the same amount, which also keeps
-    // audio roughly in step with video.
-    const target = smooth ? SMOOTH_MS : 0;
+    // With a playback buffer, buffer both tracks by the same amount, which
+    // also keeps audio roughly in step with video.
+    const target = smooth ? smoothMs : 0;
     if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = target;
     if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = target / 1000;
     // Audio plays from its own element so the video element never waits on
@@ -641,26 +641,40 @@ window.addEventListener('pointermove', (e) => {
   hud.hidden = e.clientY > 48 && !hud.matches(':hover') && document.activeElement !== sourcesEl;
 });
 
-// ---- smooth mode ----
-// Off: frames render the moment they decode (lowest latency). On: the
-// browser buffers SMOOTH_MS so video plays evenly over a jittery network,
-// at that much extra latency. ?smooth in the URL turns it on.
+// ---- playback buffer ----
+// 0 ("Live"): frames render the moment they decode, for the lowest latency.
+// Otherwise the browser buffers that many ms of video and audio so they
+// play evenly over a jittery network (and stay roughly in step), at that
+// much extra latency. ?smooth=<ms> in the URL sets it (?smooth alone: 150).
 
-const SMOOTH_MS = 150;
-const smoothBtn = document.getElementById('smooth');
-let smooth = new URLSearchParams(location.search).has('smooth');
-try { smooth ||= localStorage.getItem('urdp.smooth') === '1'; } catch { /* storage unavailable */ }
-function showSmooth() {
-  smoothBtn.textContent = smooth ? 'Smooth' : 'Live';
-  smoothBtn.classList.toggle('on', smooth);
+const BUFFER_CHOICES = [0, 50, 100, 150, 250, 400, 750];
+const smoothSel = document.getElementById('smooth');
+let smoothMs = 0;
+try { smoothMs = Number(localStorage.getItem('urdp.bufferMs')) || 0; } catch { /* storage unavailable */ }
+{
+  const q = new URLSearchParams(location.search);
+  if (q.has('smooth')) smoothMs = Number(q.get('smooth')) || 150;
 }
-smoothBtn.onclick = () => {
-  smooth = !smooth;
-  try { localStorage.setItem('urdp.smooth', smooth ? '1' : '0'); } catch { /* storage unavailable */ }
-  showSmooth();
-  if (started) reconnect(); // the offer changes, so renegotiate
+smoothMs = Math.max(0, Math.min(4000, smoothMs));
+let smooth = smoothMs > 0; // fixed for the connection: changes the offer
+for (const ms of new Set([...BUFFER_CHOICES, smoothMs].sort((a, b) => a - b))) {
+  smoothSel.add(new Option(ms ? `${ms}ms buffer` : 'Live', ms));
+}
+smoothSel.value = smoothMs;
+smoothSel.onchange = () => {
+  smoothMs = Number(smoothSel.value);
+  try { localStorage.setItem('urdp.bufferMs', smoothMs); } catch { /* storage unavailable */ }
+  if (started && smooth !== smoothMs > 0) {
+    // Going to or from Live changes the zero playout-delay negotiation.
+    smooth = smoothMs > 0;
+    reconnect();
+    return;
+  }
+  // Between buffer sizes, the receivers adjust in place.
+  pc?.getReceivers().forEach((r) => {
+    if ('jitterBufferTarget' in r) r.jitterBufferTarget = smoothMs;
+  });
 };
-showSmooth();
 
 // ---- scaling ----
 // "fit" scales the stream to the window; "native" shows host pixels 1:1
