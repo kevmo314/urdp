@@ -82,8 +82,10 @@ type Server struct {
 	injOnce sync.Once
 	inj     input.Injector
 
-	cursorOnce     sync.Once
 	cursorMu       sync.Mutex
+	cursorStop     context.CancelFunc
+	cursorDone     chan struct{}
+	cursorPrevDone chan struct{}
 	cursorCurrent  *capture.Cursor
 	cursorSessions map[*session]bool
 

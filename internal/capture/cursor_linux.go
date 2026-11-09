@@ -32,6 +32,7 @@ import (
 	"errors"
 	"image"
 	"os"
+	"time"
 	"unsafe"
 
 	"github.com/kevmo314/urdp/internal/xlib"
@@ -76,6 +77,12 @@ func WatchCursor(ctx context.Context, fn func(Cursor)) error {
 		// XACE may deny reads after the creating client exits (xsetroot).
 		// Notifications still supply the name and serial in that case.
 		im := C.XFixesGetCursorImage(d)
+		// Reading a just-changed cursor can transiently fail (seen when
+		// its creator frees it and exits, as xsetroot does); retry briefly.
+		for i := 0; im == nil && atom == 0 && i < 5 && ctx.Err() == nil; i++ {
+			time.Sleep(10 * time.Millisecond)
+			im = C.XFixesGetCursorImage(d)
+		}
 		c := Cursor{Serial: uint64(serial)}
 		if im != nil {
 			c.Serial, c.HotX, c.HotY = uint64(im.cursor_serial), int(im.xhot), int(im.yhot)

@@ -10,10 +10,20 @@ import "C"
 
 import (
 	"context"
+	"errors"
 	"image"
 	"time"
 	"unsafe"
 )
+
+// renderCursor draws a cursor handle as a w×h PNG.
+func renderCursor(handle uint64, w, h int) ([]byte, error) {
+	im := image.NewRGBA(image.Rect(0, 0, w, h))
+	if C.capture_cursor_render(C.uint64_t(handle), C.int(w), C.int(h), (*C.uchar)(unsafe.Pointer(&im.Pix[0]))) == 0 {
+		return nil, errors.New("cursor: render failed")
+	}
+	return cursorPNG(im)
+}
 
 // WatchCursor reports the initial cursor and subsequent shape/visibility changes
 // until ctx is canceled. Pointer motion alone does not trigger a callback.
@@ -34,15 +44,11 @@ func WatchCursor(ctx context.Context, fn func(Cursor)) error {
 				if kind >= 0 {
 					c.CSS = names[int(kind)]
 				} else {
-					im := image.NewRGBA(image.Rect(0, 0, int(w), int(h)))
-					if C.capture_cursor_render(handle, w, h, (*C.uchar)(unsafe.Pointer(&im.Pix[0]))) == 0 {
+					data, err := renderCursor(uint64(handle), int(w), int(h))
+					if err != nil {
 						goto wait
 					}
-					var err error
-					c.PNG, err = cursorPNG(im)
-					if err != nil {
-						return err
-					}
+					c.PNG = data
 				}
 			}
 			fn(c)

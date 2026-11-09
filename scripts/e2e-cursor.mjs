@@ -1,7 +1,7 @@
 // Cursor propagation check against a Linux server capturing $DISPLAY.
 // DISPLAY=:99 node scripts/e2e-cursor.mjs [http://localhost:8000/]
 import { spawn, execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import assert from 'node:assert/strict';
@@ -43,7 +43,7 @@ try {
     ws.send(JSON.stringify({ id: i, method: 'Runtime.evaluate', params: { expression, awaitPromise: true, returnByValue: true } }));
   });
   for (let i = 0; i < 50; i++) {
-    if (await evaluate("document.readyState === 'complete'")) break;
+    if (await evaluate("document.readyState === 'complete' && !!document.getElementById('start')")) break;
     await sleep(100);
   }
   await evaluate("document.getElementById('start').click()");
@@ -65,6 +65,19 @@ try {
     assert.equal(actual, css, `${name} cursor`);
     console.log(`${name} -> video.style.cursor = ${actual}`);
   }
+  // A bitmap cursor has no standard name, so it must arrive as an image.
+  const xbm = join(profile, 'cursor.xbm');
+  writeFileSync(xbm, '#define c_width 16\n#define c_height 16\n#define c_x_hot 3\n#define c_y_hot 5\nstatic unsigned char c_bits[] = {\n' +
+    Array(32).fill('0xff').join(', ') + ' };\n');
+  execFileSync('xsetroot', ['-cursor', xbm, xbm]);
+  let actual;
+  for (let i = 0; i < 50; i++) {
+    actual = await evaluate("document.getElementById('video').style.cursor");
+    if (actual.startsWith('url(')) break;
+    await sleep(100);
+  }
+  assert.match(actual, /^url\("data:image\/png;base64,.+"\) 3 5, auto$/, 'bitmap cursor');
+  console.log(`bitmap -> video.style.cursor = ${actual.slice(0, 40)}... ${actual.slice(-10)}`);
 } finally {
   ws?.close();
   chrome.kill();

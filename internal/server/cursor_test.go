@@ -15,6 +15,12 @@ import (
 
 func cursorClient(t *testing.T, url string) <-chan map[string]any {
 	t.Helper()
+	_, m := cursorPeer(t, url)
+	return m
+}
+
+func cursorPeer(t *testing.T, url string) (*webrtc.PeerConnection, <-chan map[string]any) {
+	t.Helper()
 	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatal(err)
@@ -60,7 +66,7 @@ func cursorClient(t *testing.T, url string) <-chan map[string]any {
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		t.Fatal(err)
 	}
-	return messages
+	return pc, messages
 }
 
 func expectCursor(t *testing.T, messages <-chan map[string]any, want string) {
@@ -130,5 +136,39 @@ func TestCursorBroadcastAndSessionCache(t *testing.T) {
 	expectCursor(t, c, `{"t":"cursor","id":1,"css":"default"}`)
 	if starts.Load() != 1 {
 		t.Fatalf("watcher started %d times", starts.Load())
+	}
+}
+
+func TestCursorWatcherStopsWithoutViewers(t *testing.T) {
+	var running, starts atomic.Int32
+	_, ts := newTestServer(t, &fakeInjector{}, func(cfg *Config) {
+		cfg.WatchCursor = func(ctx context.Context, fn func(capture.Cursor)) error {
+			if running.Add(1) != 1 {
+				t.Error("two cursor watchers at once")
+			}
+			defer running.Add(-1)
+			starts.Add(1)
+			fn(capture.Cursor{Serial: 1, CSS: "default"})
+			<-ctx.Done()
+			return ctx.Err()
+		}
+	})
+	waitFor := func(what string, ok func() bool) {
+		t.Helper()
+		for deadline := time.Now().Add(10 * time.Second); !ok(); {
+			if time.Now().After(deadline) {
+				t.Fatal(what)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	for round := 1; round <= 2; round++ {
+		pc, msgs := cursorPeer(t, ts.URL)
+		expectCursor(t, msgs, `{"t":"cursor","id":1,"css":"default"}`)
+		if got := starts.Load(); got != int32(round) {
+			t.Fatalf("round %d: watcher started %d times", round, got)
+		}
+		_ = pc.Close()
+		waitFor("watcher still running after the last viewer left", func() bool { return running.Load() == 0 })
 	}
 }

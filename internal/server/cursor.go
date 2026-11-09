@@ -8,6 +8,8 @@ import (
 	"github.com/kevmo314/urdp/internal/capture"
 )
 
+const maxCursorCache = 256
+
 // The cursor lock orders initial snapshots and broadcasts so an opening viewer
 // cannot receive a stale snapshot after a newer notification.
 func (s *Server) addCursorSession(sess *session) {
@@ -23,14 +25,28 @@ func (s *Server) addCursorSession(sess *session) {
 	if s.cursorCurrent != nil {
 		sess.sendCursor(*s.cursorCurrent)
 	}
-	s.cursorMu.Unlock()
-	s.cursorOnce.Do(func() {
+	// Watch only while someone is viewing: the Windows and macOS watchers
+	// poll. The last viewer leaving stops it; the next one restarts it.
+	if s.cursorStop == nil {
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		s.cursorStop, s.cursorDone = cancel, done
+		prev := s.cursorPrevDone
 		go func() {
-			if err := s.cfg.WatchCursor(context.Background(), s.broadcastCursor); err != nil {
+			defer close(done)
+			if prev != nil {
+				<-prev // one watcher at a time
+			}
+			if err := s.cfg.WatchCursor(ctx, func(c capture.Cursor) {
+				if ctx.Err() == nil {
+					s.broadcastCursor(c)
+				}
+			}); err != nil && ctx.Err() == nil {
 				log.Printf("cursor: %v", err)
 			}
 		}()
-	})
+	}
+	s.cursorMu.Unlock()
 }
 
 func (s *Server) removeCursorSession(sess *session) {
@@ -38,6 +54,12 @@ func (s *Server) removeCursorSession(sess *session) {
 	defer s.cursorMu.Unlock()
 	sess.cursorClosed = true
 	delete(s.cursorSessions, sess)
+	if len(s.cursorSessions) == 0 && s.cursorStop != nil {
+		s.cursorStop()
+		s.cursorStop, s.cursorPrevDone = nil, s.cursorDone
+		// The next watcher reports the shape afresh.
+		s.cursorCurrent = nil
+	}
 }
 
 func (s *Server) broadcastCursor(c capture.Cursor) {
@@ -76,7 +98,9 @@ func (s *session) sendCursor(c capture.Cursor) {
 		return
 	}
 	if err := s.sendLocked(string(data)); err == nil && !c.Hidden {
-		if s.cursorIDs == nil {
+		// Apps can mint a new cursor handle per change; bound what this
+		// viewer is assumed to have cached (it re-sends after a reset).
+		if s.cursorIDs == nil || len(s.cursorIDs) >= maxCursorCache {
 			s.cursorIDs = make(map[uint64]bool)
 		}
 		s.cursorIDs[c.Serial] = true
