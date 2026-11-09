@@ -115,6 +115,7 @@ func (p *pipeline) run() {
 	defer p.src.Close()
 
 	var enc encoder.Encoder
+	var lastOpenErr string
 	defer func() {
 		if enc != nil {
 			enc.Close()
@@ -184,11 +185,23 @@ func (p *pipeline) run() {
 		if enc == nil {
 			opts := p.opts
 			opts.BitrateKbps = kbps // keep the congestion-controlled cap
+			// Offer the capture's GPU device so a hardware encoder can take
+			// frames without a round trip through the CPU.
+			if d, ok := p.src.(interface{ GPUDevice() any }); ok {
+				opts.GPUDevice = d.GPUDevice()
+			}
 			if enc, err = encoder.New(p.codec, f.Width, f.Height, opts); err != nil {
-				log.Printf("source %s: %v", p.id, err)
+				// Usually permanent (no backend for this codec at this
+				// size): say so once and retry slowly, e.g. after a resize.
+				if msg := err.Error(); msg != lastOpenErr {
+					log.Printf("source %s: %v", p.id, err)
+					lastOpenErr = msg
+				}
 				enc = nil
+				timer.Reset(time.Second)
 				continue
 			}
+			lastOpenErr = ""
 			// Let capture hand over GPU frames (zero-copy) only once the
 			// backend that will take them is open, so a software fallback
 			// keeps getting CPU pixels. The current frame stays valid.
@@ -221,6 +234,10 @@ func (p *pipeline) run() {
 		data, _, err := enc.Encode(f, t0.Sub(start).Milliseconds(), p.keyframe.Swap(false))
 		if err != nil {
 			log.Printf("source %s: encode: %v", p.id, err)
+			if errors.Is(err, encoder.ErrReopen) {
+				enc.Close()
+				enc = nil
+			}
 			continue
 		}
 		t2 := time.Now()

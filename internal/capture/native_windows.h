@@ -24,10 +24,20 @@ long capture_open_display(unsigned int adapter, unsigned int output, capture_nat
 void capture_dpi(void);
 long capture_open(uint64_t hwnd, capture_native **out);
 long capture_bounds(capture_native *s, capture_rect *r);
+// A frame is either CPU pixels or, in GPU mode, a D3D11 texture (BGRA,
+// at least w x h) on device. The texture is owned by the capture and is
+// updated in place by the next capture_frame.
 typedef struct {
     unsigned char *pixels;
     int stride, w, h;
+    void *texture, *device;
 } capture_image;
+// capture_set_gpu switches between CPU frames and GPU textures. It returns
+// whether GPU mode is now on: it is refused when monitors span adapters.
+// Rotated monitors and fallback paths still produce CPU frames.
+int capture_set_gpu(capture_native *s, int on);
+// capture_device is the ID3D11Device GPU textures will live on, or NULL.
+void *capture_device(capture_native *s);
 long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms);
 void capture_close(capture_native *s);
 long capture_list(capture_window **out, int *count);

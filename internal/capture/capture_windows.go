@@ -83,15 +83,65 @@ func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	if err := s.resize(); err != nil {
 		return nil, false, err
 	}
-	if image.pixels == nil {
+	w, h, stride := int(image.w), int(image.h), int(image.stride)
+	switch {
+	case image.texture != nil:
+		s.frame = Frame{Width: w, Height: h, GPU: D3D11Texture{Device: image.device, Texture: image.texture}}
+	case image.pixels != nil:
+		s.frame = Frame{
+			Pix:    unsafe.Slice((*byte)(unsafe.Pointer(image.pixels)), (h-1)*stride+w*4),
+			Stride: stride, Width: w, Height: h,
+		}
+	default:
 		return nil, false, fmt.Errorf("capture has not produced a frame")
 	}
-	w, h, stride := int(image.w), int(image.h), int(image.stride)
-	s.frame = Frame{
-		Pix:    unsafe.Slice((*byte)(unsafe.Pointer(image.pixels)), (h-1)*stride+w*4),
-		Stride: stride, Width: w, Height: h,
-	}
 	return &s.frame, hr == 0, nil
+}
+
+// D3D11Texture is a Windows frame left in GPU memory: an ID3D11Texture2D
+// (DXGI_FORMAT_B8G8R8A8_UNORM, at least Width x Height) on an
+// ID3D11Device. It is owned by the source and overwritten by the next
+// Capture.
+type D3D11Texture struct {
+	Device, Texture unsafe.Pointer
+}
+
+// SetGPUOutput switches between CPU pixels and D3D11Texture frames. Even
+// with it on, some frames (rotated monitors, fallbacks) come as CPU pixels.
+func (s *windowsSource) SetGPUOutput(on bool) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.native == nil {
+		return fmt.Errorf("capture closed")
+	}
+	if got := C.capture_set_gpu(s.native, cbool(on)) != 0; got != on {
+		return fmt.Errorf("GPU frames unavailable (monitors on several adapters?)")
+	}
+	return nil
+}
+
+// GPUDevice is the ID3D11Device that GPU frames will be on, for opening an
+// encoder that can take them.
+func (s *windowsSource) GPUDevice() any {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.native == nil {
+		return nil
+	}
+	if d := C.capture_device(s.native); d != nil {
+		return D3D11Device(d)
+	}
+	return nil
+}
+
+// D3D11Device is an ID3D11Device pointer.
+type D3D11Device unsafe.Pointer
+
+func cbool(b bool) C.int {
+	if b {
+		return 1
+	}
+	return 0
 }
 func (s *windowsSource) Bounds() image.Rectangle {
 	s.mu.Lock()

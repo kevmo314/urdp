@@ -44,7 +44,7 @@ claude mcp add --transport http urdp http://host:8000/mcp --header "Authorizatio
 | Desktop capture | XShm on the root window (cropped per monitor via XRandR) | DXGI Desktop Duplication per output, stitched, dirty rects only | ScreenCaptureKit per display, stitched |
 | Window capture | XComposite-redirected window + XShm | Windows.Graphics.Capture (PrintWindow fallback) | ScreenCaptureKit window filter |
 | Change detection | XDamage | DXGI / WGC frame events | SCFrameStatus |
-| Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | libx264 (static) | VideoToolbox H.264/HEVC; libx264 fallback (static) |
+| Video encode | libx264; libvpx (VP8/VP9), libaom (AV1); VA-API (H.264/HEVC) | AMD AMF (H.264/HEVC/AV1) from GPU textures via a minimal static FFmpeg; libx264 fallback (static) | VideoToolbox H.264/HEVC; libx264 fallback (static) |
 | Audio | PulseAudio/PipeWire monitor → Opus | WASAPI loopback → Opus | ScreenCaptureKit audio → Opus |
 | Cursor shape | XFixes events | GetCursorInfo at 60 Hz | NSCursor.currentSystemCursor at 60 Hz |
 | Input | XTest | `SendInput` (scancodes) | CGEvent |
@@ -122,6 +122,17 @@ Cross-compile from Linux or WSL with mingw-w64. The result is a single `urdp.exe
 sudo apt install gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 nasm pkg-config
 make windows    # builds codecs and camera source, then bin/urdp.exe
 ```
+
+#### Hardware encoding (Windows)
+
+`make windows` builds a minimal static FFmpeg (only libavcodec/libavutil with the AMF, NVENC and Media Foundation encoders and D3D11 frames; about 10 MB) and links it in. The vendor runtimes are loaded only when an encoder opens, so `urdp.exe` still starts on machines without them.
+
+- **Zero-copy.** Desktop Duplication frames stay on the GPU: monitors on the same adapter share one D3D11 device, dirty rectangles are copied texture-to-texture (also when stitching monitors), and the encoder gets the BGRA texture with one GPU copy into FFmpeg's frame pool; AMF converts it to BT.709 YUV itself. Rotated monitors and the GDI fallback still produce CPU frames, which are uploaded. On an RX 7900 XTX this halves encode time (3440×1440 H.264: 3.6ms vs 7.7ms from CPU memory; 4880×2560 HEVC: 7.6ms vs 18.4ms) and skips the CPU readback of changed frames.
+- **No added latency.** Each encoder is forced into its low-latency mode (no B-frames, no lookahead, one frame in flight, forced IDR on request) and must return each frame's packet before the next frame is submitted; one that holds frames back is refused. One hardware session runs at a time.
+- **AMD AMF** (`libav-h264_amf`, `libav-hevc_amf`, `libav-av1_amf`) is tested and used automatically. H.264 tops out at 4096 pixels wide, so a wider desktop falls back to x264 (use H.265). RDNA3's AV1 encoder pads widths to a multiple of 64, which WebRTC can't crop, so it is refused at those sizes.
+- **NVENC and Media Foundation** (`libav-h264_nvenc`, `libav-hevc_nvenc`, `libav-av1_nvenc`, `libav-h264_mf`, `libav-hevc_mf`) haven't been tested on real hardware yet, so they're only used when named with `-encoder`.
+
+`go test -tags libav ./internal/encoder -run TestLibavD3D11` with `URDP_TEST_ENCODER=h264_amf` (and `WSLENV=URDP_TEST_ENCODER` when running from WSL) encodes a texture through the GPU path and the CPU path; `URDP_TEST_DUMP` saves the streams for checking colors with a decoder.
 
 On Windows x64, run `urdp.exe -install-drivers` once. It requests elevation once,
 installs bundled Microsoft-signed gamepad/USB-IP drivers, and prints whether a

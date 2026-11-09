@@ -12,8 +12,9 @@ linux:
 windows-deps:
 	scripts/build-windows-deps.sh
 
+# Windows links a minimal static FFmpeg for hardware encoding (tag libav).
 windows: windows-deps
-	$(WIN_ENV) go build -ldflags "-s -w" -o bin/urdp.exe .
+	$(WIN_ENV) go build -tags libav -ldflags "-s -w" -o bin/urdp.exe .
 
 test:
 	go test -race ./...
@@ -22,7 +23,7 @@ vet:
 	go vet ./...
 
 vet-windows: windows-deps
-	$(WIN_ENV) go vet ./...
+	$(WIN_ENV) go vet -tags libav ./...
 
 clean:
 	rm -rf bin

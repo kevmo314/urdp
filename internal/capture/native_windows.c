@@ -2,6 +2,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include "native_windows.h"
 #include "wgc_windows.h"
+#include <d3d10.h>
 #include <d3d11.h>
 #include <dwmapi.h>
 #include <dxgi1_5.h>
@@ -29,6 +30,12 @@ struct capture_native {
     unsigned char *rotated;
     size_t rotated_size;
     capture_wgc *wgc;
+    // GPU mode: frames stay in gpu (D3D11_USAGE_DEFAULT) on device.
+    int gpu_mode;
+    ID3D11Texture2D *gpu;
+    // Monitors of a composite on the parent's adapter share its device,
+    // so their textures can be composited on the GPU.
+    ID3D11Device *shared;
     unsigned char *metadata;
     UINT metadata_size;
     HDC dc;
@@ -44,6 +51,42 @@ struct capture_native {
             (p) = NULL;                                                                            \
         }                                                                                          \
     } while (0)
+#define HAS_IMAGE(s) ((s)->image.pixels || (s)->image.texture)
+// Hardware encoders use the device from their own threads.
+static void protect(ID3D11Device *device) {
+    ID3D10Multithread *mt = NULL;
+    if (SUCCEEDED(ID3D11Device_QueryInterface(device, &IID_ID3D10Multithread, (void **)&mt))) {
+        ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
+        ID3D10Multithread_Release(mt);
+    }
+}
+// Video support lets FFmpeg's D3D11 frames (and so hardware encoders) use
+// the device; not every driver offers it, so fall back without.
+static HRESULT create_device(IDXGIAdapter *adapter, ID3D11Device **device,
+                             ID3D11DeviceContext **context) {
+    D3D_DRIVER_TYPE type = adapter ? D3D_DRIVER_TYPE_UNKNOWN : D3D_DRIVER_TYPE_HARDWARE;
+    UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
+    HRESULT hr = D3D11CreateDevice(adapter, type, NULL, flags, NULL, 0, D3D11_SDK_VERSION, device,
+                                   NULL, context);
+    if (FAILED(hr))
+        hr = D3D11CreateDevice(adapter, type, NULL, D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0,
+                               D3D11_SDK_VERSION, device, NULL, context);
+    if (SUCCEEDED(hr))
+        protect(*device);
+    return hr;
+}
+static HRESULT adapter_device(UINT index, ID3D11Device **device, ID3D11DeviceContext **context) {
+    IDXGIFactory1 *factory = NULL;
+    IDXGIAdapter1 *adapter = NULL;
+    HRESULT hr = CreateDXGIFactory1(&IID_IDXGIFactory1, (void **)&factory);
+    if (SUCCEEDED(hr))
+        hr = IDXGIFactory1_EnumAdapters1(factory, index, &adapter);
+    if (SUCCEEDED(hr))
+        hr = create_device((IDXGIAdapter *)adapter, device, context);
+    RELEASE(adapter);
+    RELEASE(factory);
+    return hr;
+}
 void capture_dpi(void) {
     typedef BOOL(WINAPI * dpi_fn)(HANDLE);
     dpi_fn fn =
@@ -61,9 +104,13 @@ static HRESULT desktop_init(capture_native *s) {
     unmap(s);
     s->image = (capture_image){0};
     RELEASE(s->staging);
+    RELEASE(s->gpu);
     RELEASE(s->dup);
-    RELEASE(s->context);
-    RELEASE(s->device);
+    // Keep the device (an encoder may be using it) unless it was lost.
+    if (s->device && ID3D11Device_GetDeviceRemovedReason(s->device) != S_OK && !s->shared) {
+        RELEASE(s->context);
+        RELEASE(s->device);
+    }
     IDXGIFactory1 *factory = NULL;
     IDXGIAdapter1 *adapter = NULL;
     IDXGIOutput *output = NULL;
@@ -84,10 +131,14 @@ static HRESULT desktop_init(capture_native *s) {
         RECT r = desc.DesktopCoordinates;
         s->rect = (capture_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
         s->rotation = desc.Rotation;
-        hr = D3D11CreateDevice((IDXGIAdapter *)adapter, D3D_DRIVER_TYPE_UNKNOWN, NULL, 0, NULL, 0,
-                               D3D11_SDK_VERSION, &s->device, NULL, &s->context);
+        if (!s->device && s->shared) {
+            s->device = s->shared;
+            ID3D11Device_AddRef(s->device);
+            ID3D11Device_GetImmediateContext(s->device, &s->context);
+        } else if (!s->device)
+            hr = create_device((IDXGIAdapter *)adapter, &s->device, &s->context);
     }
-    if (SUCCEEDED(hr)) {
+    for (int attempt = 0; SUCCEEDED(hr) && attempt < 2; attempt++) {
         hr = IDXGIOutput_QueryInterface(output, &IID_IDXGIOutput5, (void **)&output5);
         if (SUCCEEDED(hr)) {
             const DXGI_FORMAT format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -99,6 +150,15 @@ static HRESULT desktop_init(capture_native *s) {
             if (SUCCEEDED(hr))
                 hr = IDXGIOutput1_DuplicateOutput(output1, (IUnknown *)s->device, &s->dup);
         }
+        RELEASE(output5);
+        RELEASE(output1);
+        // A kept device can belong to the wrong adapter after the output
+        // moved; make a fresh one and try once more.
+        if (SUCCEEDED(hr) || s->shared || attempt)
+            break;
+        RELEASE(s->context);
+        RELEASE(s->device);
+        hr = create_device((IDXGIAdapter *)adapter, &s->device, &s->context);
     }
     RELEASE(output5);
     RELEASE(output1);
@@ -126,18 +186,23 @@ long capture_bounds(capture_native *s, capture_rect *r) {
     if (FAILED(hr))
         return hr;
     *r = s->rect;
-    if (s->hwnd && s->image.pixels) {
+    if (s->hwnd && HAS_IMAGE(s)) {
         r->w = s->image.w;
         r->h = s->image.h;
     }
     return S_OK;
 }
-long capture_open_display(unsigned int adapter, unsigned int output, capture_native **out) {
+static long open_output(unsigned int adapter, unsigned int output, ID3D11Device *shared,
+                        capture_native **out) {
     capture_native *s = calloc(1, sizeof(*s));
     if (!s)
         return E_OUTOFMEMORY;
     s->adapter_index = adapter;
     s->output_index = output;
+    if (shared) {
+        s->shared = shared;
+        ID3D11Device_AddRef(shared);
+    }
     HRESULT hr = desktop_init(s);
     if (FAILED(hr)) {
         capture_close(s);
@@ -145,6 +210,9 @@ long capture_open_display(unsigned int adapter, unsigned int output, capture_nat
     }
     *out = s;
     return S_OK;
+}
+long capture_open_display(unsigned int adapter, unsigned int output, capture_native **out) {
+    return open_output(adapter, output, NULL, out);
 }
 static HRESULT composite_init(capture_native *s) {
     capture_display *displays = NULL;
@@ -162,8 +230,12 @@ static HRESULT composite_init(capture_native *s) {
         return E_OUTOFMEMORY;
     }
     s->output_count = count;
-    for (int i = 0; i < count; i++) {
-        hr = capture_open_display(displays[i].adapter, displays[i].output, &s->outputs[i]);
+    // One device for every monitor on the first monitor's adapter.
+    hr = adapter_device(displays[0].adapter, &s->device, &s->context);
+    for (int i = 0; SUCCEEDED(hr) && i < count; i++) {
+        int same = displays[i].adapter == displays[0].adapter;
+        hr = open_output(displays[i].adapter, displays[i].output, same ? s->device : NULL,
+                         &s->outputs[i]);
         if (FAILED(hr))
             break;
     }
@@ -188,8 +260,27 @@ static HRESULT composite_bounds(capture_native *s, int force, int *reset) {
     }
     r.w = right - r.x;
     r.h = bottom - r.y;
-    *reset = force || !s->composite || memcmp(&r, &s->rect, sizeof(r));
-    if (*reset) {
+    int have = s->gpu_mode ? s->gpu != NULL : s->composite != NULL;
+    *reset = force || !have || memcmp(&r, &s->rect, sizeof(r));
+    if (*reset && s->gpu_mode) {
+        RELEASE(s->gpu);
+        D3D11_TEXTURE2D_DESC desc = {(UINT)r.w, (UINT)r.h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+                                     D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
+        HRESULT hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, &s->gpu);
+        if (FAILED(hr))
+            return hr;
+        // Monitors needn't tile the bounding box; keep the gaps black.
+        unsigned char *black = calloc((size_t)r.w, 4);
+        if (black) {
+            for (int y = 0; y < r.h; y++) {
+                D3D11_BOX row = {0, (UINT)y, 0, (UINT)r.w, (UINT)y + 1, 1};
+                ID3D11DeviceContext_UpdateSubresource(s->context, (ID3D11Resource *)s->gpu, 0, &row,
+                                                      black, r.w * 4, 0);
+            }
+            free(black);
+        }
+        s->rect = r;
+    } else if (*reset) {
         size_t size = (size_t)r.w * r.h * 4;
         unsigned char *p = calloc(1, size);
         if (!p)
@@ -198,7 +289,10 @@ static HRESULT composite_bounds(capture_native *s, int force, int *reset) {
         s->composite = p;
         s->rect = r;
     }
-    s->image = (capture_image){s->composite, r.w * 4, r.w, r.h};
+    if (s->gpu_mode)
+        s->image = (capture_image){NULL, 0, r.w, r.h, s->gpu, s->device};
+    else
+        s->image = (capture_image){s->composite, r.w * 4, r.w, r.h};
     return S_OK;
 }
 long capture_open(uint64_t hwnd, capture_native **out) {
@@ -217,9 +311,7 @@ long capture_open(uint64_t hwnd, capture_native **out) {
         return hr;
     }
     if (hwnd) {
-        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
-                               D3D11_CREATE_DEVICE_BGRA_SUPPORT, NULL, 0, D3D11_SDK_VERSION,
-                               &s->device, NULL, &s->context);
+        hr = create_device(NULL, &s->device, &s->context);
         if (SUCCEEDED(hr))
             capture_wgc_open(s->hwnd, s->device, &s->wgc);
     }
@@ -330,27 +422,35 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     }
     unmap(s);
     s->image = (capture_image){0};
-    if (s->staging) {
+    // GPU mode keeps the frame in a GPU texture; rotation needs the CPU.
+    int gpu = s->gpu_mode && (s->rotation == DXGI_MODE_ROTATION_IDENTITY ||
+                              s->rotation == DXGI_MODE_ROTATION_UNSPECIFIED);
+    ID3D11Texture2D **target = gpu ? &s->gpu : &s->staging;
+    if (*target) {
         D3D11_TEXTURE2D_DESC old;
-        ID3D11Texture2D_GetDesc(s->staging, &old);
+        ID3D11Texture2D_GetDesc(*target, &old);
         if (old.Width != desc.Width || old.Height != desc.Height || old.Format != desc.Format)
-            RELEASE(s->staging);
+            RELEASE(*target);
     }
-    int full = !s->staging;
+    int full = !*target;
     s->move_bytes = s->dirty_bytes = 0;
     HRESULT hr = S_OK;
-    if (!s->staging) {
-        desc.Usage = D3D11_USAGE_STAGING;
-        desc.BindFlags = 0;
-        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    if (!*target) {
+        desc.MipLevels = 1;
+        desc.ArraySize = 1;
+        desc.SampleDesc = (DXGI_SAMPLE_DESC){1, 0};
+        desc.Usage = gpu ? D3D11_USAGE_DEFAULT : D3D11_USAGE_STAGING;
+        desc.BindFlags = gpu ? D3D11_BIND_SHADER_RESOURCE : 0;
+        desc.CPUAccessFlags = gpu ? 0 : D3D11_CPU_ACCESS_READ;
         desc.MiscFlags = 0;
-        hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, &s->staging);
+        hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, target);
     }
     if (FAILED(hr))
         return hr;
+    ID3D11Resource *dst = (ID3D11Resource *)*target;
     if (box)
-        ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging, 0, 0, 0,
-                                                  0, (ID3D11Resource *)texture, 0, box);
+        ID3D11DeviceContext_CopySubresourceRegion(s->context, dst, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)texture, 0, box);
     else if (!full && info && info->TotalMetadataBufferSize) {
         if (info->TotalMetadataBufferSize > s->metadata_size) {
             unsigned char *p = realloc(s->metadata, info->TotalMetadataBufferSize);
@@ -374,8 +474,7 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
                  i++) {
                 RECT r = update_rect(s, i);
                 D3D11_BOX region = {r.left, r.top, 0, r.right, r.bottom, 1};
-                ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->staging,
-                                                          0, r.left, r.top, 0,
+                ID3D11DeviceContext_CopySubresourceRegion(s->context, dst, 0, r.left, r.top, 0,
                                                           (ID3D11Resource *)texture, 0, &region);
             }
         } else
@@ -383,9 +482,12 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     } else
         full = 1;
     if (full && !box)
-        ID3D11DeviceContext_CopyResource(s->context, (ID3D11Resource *)s->staging,
-                                         (ID3D11Resource *)texture);
+        ID3D11DeviceContext_CopyResource(s->context, dst, (ID3D11Resource *)texture);
     s->full_update = full || box != NULL;
+    if (gpu) {
+        s->image = (capture_image){NULL, 0, s->rect.w, s->rect.h, s->gpu, s->device};
+        return S_OK;
+    }
     D3D11_MAPPED_SUBRESOURCE map;
     hr = ID3D11DeviceContext_Map(s->context, (ID3D11Resource *)s->staging, 0, D3D11_MAP_READ, 0,
                                  &map);
@@ -476,6 +578,7 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
                 s->wgc = NULL;
                 unmap(s);
                 RELEASE(s->staging);
+                RELEASE(s->gpu);
                 s->image = (capture_image){0};
                 hr = gdi_frame(s);
             }
@@ -500,7 +603,7 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
         return hr;
     }
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        hr = s->image.pixels ? S_FALSE : gdi_frame(s);
+        hr = HAS_IMAGE(s) ? S_FALSE : gdi_frame(s);
         *image = s->image;
         return hr;
     }
@@ -510,7 +613,7 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
     if (!info.LastPresentTime.QuadPart) {
         RELEASE(resource);
         IDXGIOutputDuplication_ReleaseFrame(s->dup);
-        hr = s->image.pixels ? S_FALSE : gdi_frame(s);
+        hr = HAS_IMAGE(s) ? S_FALSE : gdi_frame(s);
         *image = s->image;
         return hr;
     }
@@ -538,9 +641,26 @@ static void composite_copy(capture_native *s, capture_native *o, RECT r, int rot
         r.right = w;
     if (r.bottom > h)
         r.bottom = h;
-    if (r.right <= r.left || r.bottom <= r.top || !o->image.pixels)
+    if (r.right <= r.left || r.bottom <= r.top || !HAS_IMAGE(o))
         return;
     int x = o->rect.x - s->rect.x, y = o->rect.y - s->rect.y;
+    if (s->gpu_mode) {
+        if (o->image.texture && o->device == s->device) {
+            D3D11_BOX b = {r.left, r.top, 0, r.right, r.bottom, 1};
+            ID3D11DeviceContext_CopySubresourceRegion(s->context, (ID3D11Resource *)s->gpu, 0,
+                                                      x + r.left, y + r.top, 0,
+                                                      (ID3D11Resource *)o->image.texture, 0, &b);
+        } else if (o->image.pixels) {
+            // CPU frames (rotated monitors, the GDI seed) are uploaded.
+            D3D11_BOX b = {x + r.left, y + r.top, 0, x + r.right, y + r.bottom, 1};
+            ID3D11DeviceContext_UpdateSubresource(
+                s->context, (ID3D11Resource *)s->gpu, 0, &b,
+                o->image.pixels + (size_t)r.top * o->image.stride + r.left * 4, o->image.stride, 0);
+        }
+        return;
+    }
+    if (!o->image.pixels)
+        return;
     for (int row = r.top; row < r.bottom; row++)
         memcpy(s->composite + (size_t)(y + row) * s->image.stride + (x + r.left) * 4,
                o->image.pixels + (size_t)row * o->image.stride + r.left * 4,
@@ -617,9 +737,11 @@ void capture_close(capture_native *s) {
     capture_wgc_close(s->wgc);
     unmap(s);
     RELEASE(s->staging);
+    RELEASE(s->gpu);
     RELEASE(s->dup);
     RELEASE(s->context);
     RELEASE(s->device);
+    RELEASE(s->shared);
     free(s->rotated);
     free(s->metadata);
     if (s->bitmap) {
@@ -676,3 +798,30 @@ long capture_list(capture_window **out, int *count) {
 void capture_free(void *p) {
     free(p);
 }
+
+static void reset_frames(capture_native *s, int on) {
+    unmap(s);
+    RELEASE(s->staging);
+    RELEASE(s->gpu);
+    s->image = (capture_image){0};
+    s->gpu_mode = on;
+}
+int capture_set_gpu(capture_native *s, int on) {
+    on = on != 0;
+    if (on && !s->device)
+        return 0;
+    for (int i = 0; on && i < s->output_count; i++)
+        if (s->outputs[i]->device != s->device)
+            return 0; // monitors on several adapters: composite on the CPU
+    if (s->gpu_mode == on)
+        return on;
+    // Each target holds only the updates made while it was in use, so
+    // start over; the next frame is a full one.
+    reset_frames(s, on);
+    for (int i = 0; i < s->output_count; i++)
+        reset_frames(s->outputs[i], on);
+    free(s->composite);
+    s->composite = NULL;
+    return on;
+}
+void *capture_device(capture_native *s) { return s->device; }

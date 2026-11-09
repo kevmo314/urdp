@@ -52,6 +52,10 @@ type Options struct {
 	// Backend restricts the choice to the named backend ("x264", ...);
 	// "software" or "hardware" restrict by kind; "" picks automatically.
 	Backend string
+	// GPUDevice is the capture's GPU device (e.g. capture.D3D11Device),
+	// for hardware encoders that can take its frames without a copy to
+	// the CPU. nil means CPU frames only.
+	GPUDevice any
 }
 
 // Encoder compresses one stream. Not safe for concurrent use.
@@ -70,6 +74,10 @@ type Encoder interface {
 	Close()
 }
 
+// ErrReopen from Encode asks the caller to close the encoder and open a
+// new one (e.g. the capture's GPU device changed under it).
+var ErrReopen = errors.New("encoder must be reopened")
+
 // Backend is one way of encoding a codec.
 type Backend struct {
 	Name     string
@@ -86,8 +94,9 @@ type Backend struct {
 var (
 	mu       sync.Mutex
 	backends []Backend
-	// broken remembers hardware backends that failed to open, so each
-	// new pipeline doesn't pay for probing them again.
+	// broken remembers hardware backends that failed to open at a size
+	// (missing driver, or over the hardware's size limits), so each new
+	// pipeline doesn't pay for probing them again.
 	broken = map[string]bool{}
 )
 
@@ -157,21 +166,27 @@ func New(c Codec, w, h int, o Options) (Encoder, error) {
 		if !allowed(b, o.Backend) {
 			continue
 		}
+		key := fmt.Sprintf("%s@%dx%d", b.Name, w, h)
 		mu.Lock()
-		skip := broken[b.Name]
+		skip := broken[key]
 		mu.Unlock()
 		if skip {
 			continue
 		}
 		e, err := b.New(w, h, o)
 		if err == nil {
+			gpu := ""
+			if g, ok := e.(interface{ AcceptsGPUFrames() bool }); ok && g.AcceptsGPUFrames() {
+				gpu = ", GPU frames"
+			}
+			log.Printf("encoder: %s %dx%d with %s%s", c, w, h, b.Name, gpu)
 			return e, nil
 		}
 		errs = append(errs, fmt.Errorf("%s: %w", b.Name, err))
 		if b.Hardware {
 			log.Printf("encoder: %s unavailable, falling back: %v", b.Name, err)
 			mu.Lock()
-			broken[b.Name] = true
+			broken[key] = true
 			mu.Unlock()
 		}
 	}
