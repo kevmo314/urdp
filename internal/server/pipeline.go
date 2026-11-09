@@ -62,10 +62,15 @@ func (p *pipeline) viewerStats() []map[string]any {
 	p.viewersMu.Lock()
 	defer p.viewersMu.Unlock()
 	out := []map[string]any{}
-	for _, v := range p.viewers {
+	for s, v := range p.viewers {
 		st := v.bwe.GetStats()
 		st["targetBitrate"] = v.bwe.GetTargetBitrate()
 		st["cap"] = v.rc.cap
+		s.reportMu.Lock()
+		if s.report != nil {
+			st["viewer"] = s.report
+		}
+		s.reportMu.Unlock()
 		out = append(out, st)
 	}
 	return out

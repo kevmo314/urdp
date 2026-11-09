@@ -89,8 +89,8 @@ type Server struct {
 	cursorCurrent  *capture.Cursor
 	cursorSessions map[*session]bool
 
-	audioOnce  sync.Once
-	audioTrack *webrtc.TrackLocalStaticSample
+	audioOnce   sync.Once
+	audioTracks *audioTracks
 }
 
 func New(cfg Config) (*Server, error) {
@@ -213,8 +213,11 @@ func newAPI(cfg Config) (*webrtc.API, func() cc.BandwidthEstimator, error) {
 			MimeType: webrtc.MimeTypeOpus, ClockRate: 48000, Channels: 2,
 			SDPFmtpLine: "minptime=10;useinbandfec=1;stereo=1",
 		},
-		PayloadType: 111,
+		PayloadType: opusPayloadType,
 	}, webrtc.RTPCodecTypeAudio); err != nil {
+		return nil, nil, err
+	}
+	if err := m.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: redCapability, PayloadType: redPayloadType}, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, nil, err
 	}
 	if err := m.RegisterHeaderExtension(webrtc.RTPHeaderExtensionCapability{URI: PlayoutDelayURI}, webrtc.RTPCodecTypeVideo); err != nil {
@@ -357,6 +360,7 @@ func (s *Server) handleStats(w http.ResponseWriter, r *http.Request) {
 	for id, p := range s.pipelines {
 		out[id] = map[string]any{"codec": p.codec, "viewers": p.refs, "stats": p.Stats(), "congestion": p.viewerStats()}
 	}
+	out["audio"] = AudioSendStats()
 	s.mu.Unlock()
 	writeJSON(w, out)
 }
@@ -417,7 +421,7 @@ func (s *Server) injector() input.Injector {
 	return s.inj
 }
 
-func (s *Server) audio() *webrtc.TrackLocalStaticSample {
+func (s *Server) audio() *audioTracks {
 	s.audioOnce.Do(func() {
 		if s.cfg.AudioKbps <= 0 {
 			return
@@ -427,9 +431,9 @@ func (s *Server) audio() *webrtc.TrackLocalStaticSample {
 			log.Printf("audio disabled: %v", err)
 			return
 		}
-		s.audioTrack = t
+		s.audioTracks = t
 	})
-	return s.audioTrack
+	return s.audioTracks
 }
 
 // connectTimeout bounds how long an answered offer may take to connect.
@@ -498,7 +502,13 @@ func (s *Server) negotiate(id string, offer webrtc.SessionDescription, codec str
 	}
 	go readRTCP(sender, p)
 	if at := s.audio(); at != nil {
-		as, err := pc.AddTrack(at)
+		// RED where the browser offers it: lost audio packets are rebuilt
+		// from the redundancy in the next ones instead of concealed.
+		track := at.opus
+		if offersRED(offer.SDP) {
+			track = at.red
+		}
+		as, err := pc.AddTrack(track)
 		if err != nil {
 			return fail(err)
 		}

@@ -16,6 +16,9 @@ import (
 // (unordered, no retransmits, so a lost pointer position is simply
 // superseded by the next) and "input" (reliable, for buttons and keys).
 type session struct {
+	reportMu sync.Mutex
+	report   json.RawMessage
+
 	server       *Server
 	cursorIDs    map[uint64]bool
 	cursorClosed bool // protected by server.cursorMu
@@ -40,6 +43,18 @@ func (s *session) onDataChannel(dc *webrtc.DataChannel) {
 	}
 	if dc.Label() == "usb" {
 		s.onUSB(dc)
+		return
+	}
+	if dc.Label() == "stats" {
+		// The viewer's own timing (jitter buffers, playout delay), shown
+		// in /api/stats for diagnosing latency it alone can measure.
+		dc.OnMessage(func(m webrtc.DataChannelMessage) {
+			if len(m.Data) <= 4096 && json.Valid(m.Data) {
+				s.reportMu.Lock()
+				s.report = append(json.RawMessage(nil), m.Data...)
+				s.reportMu.Unlock()
+			}
+		})
 		return
 	}
 	if dc.Label() == "input" {

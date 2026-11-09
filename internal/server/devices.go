@@ -3,6 +3,7 @@ package server
 import (
 	"encoding/json"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -53,7 +54,13 @@ func (s *Server) receiveMicrophone(t *webrtc.TrackRemote, notify func(dev, msg s
 			}
 		}
 		first, lastSeq = false, pkt.SequenceNumber
-		n, err := dec.Decode(pkt.Payload, pcm)
+		payload := pkt.Payload
+		if strings.EqualFold(t.Codec().MimeType, "audio/red") {
+			if payload, err = redPrimary(payload); err != nil {
+				continue
+			}
+		}
+		n, err := dec.Decode(payload, pcm)
 		if err != nil {
 			continue
 		}

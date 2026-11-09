@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"errors"
 	"image"
 	"image/png"
@@ -242,11 +243,28 @@ func TestWindowsAPI(t *testing.T) {
 }
 
 func TestAudio(t *testing.T) {
+	for _, red := range []bool{false, true} {
+		t.Run(fmt.Sprintf("red=%v", red), func(t *testing.T) { testAudio(t, red) })
+	}
+}
+
+// testAudio receives the host's audio as plain Opus, or as RED when the
+// client offers it (with the previous frames riding along).
+func testAudio(t *testing.T, red bool) {
 	_, ts := newTestServer(t, &fakeInjector{}, func(c *Config) {
 		c.AudioKbps = 64
 		c.OpenAudio = func() (audio.Source, error) { return &toneSource{}, nil }
 	})
-	pc, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		t.Fatal(err)
+	}
+	if red {
+		if err := m.RegisterCodec(webrtc.RTPCodecParameters{RTPCodecCapability: redCapability, PayloadType: redPayloadType}, webrtc.RTPCodecTypeAudio); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pc, err := webrtc.NewAPI(webrtc.WithMediaEngine(m)).NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -256,23 +274,33 @@ func TestAudio(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	got := make(chan int, 1)
+	got := make(chan string, 1)
 	pc.OnTrack(func(tr *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		if tr.Kind() != webrtc.RTPCodecTypeAudio {
 			return
 		}
-		n := 0
+		n, redundant := 0, 0
 		for {
 			pkt, _, err := tr.ReadRTP()
 			if err != nil {
 				return
 			}
+			payload := pkt.Payload
+			if strings.EqualFold(tr.Codec().MimeType, "audio/red") {
+				if len(payload) > 0 && payload[0]&0x80 != 0 {
+					redundant++
+				}
+				if payload, err = redPrimary(payload); err != nil {
+					got <- "bad RED payload: " + err.Error()
+					return
+				}
+			}
 			// A 440Hz tone needs real payload, not Opus DTX/silence frames.
-			if len(pkt.Payload) > 20 {
+			if len(payload) > 20 {
 				n++
 			}
 			if n == 50 {
-				got <- int(tr.Codec().ClockRate)
+				got <- fmt.Sprintf("%s redundant=%v", strings.ToLower(tr.Codec().MimeType), redundant > 40)
 				return
 			}
 		}
@@ -291,8 +319,15 @@ func TestAudio(t *testing.T) {
 	if err := pc.SetRemoteDescription(answer); err != nil {
 		t.Fatal(err)
 	}
+	want := "audio/opus redundant=false"
+	if red {
+		want = "audio/red redundant=true"
+	}
 	select {
-	case <-got:
+	case g := <-got:
+		if g != want {
+			t.Errorf("got %s, want %s", g, want)
+		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("no audio received")
 	}

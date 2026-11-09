@@ -42,6 +42,7 @@ async function negotiate(pc) {
     if (track) sender.replaceTrack(track);
   }
   pads = pc.createDataChannel('gamepad', { ordered: false, maxRetransmits: 0 });
+  statsChannel = pc.createDataChannel('stats', { ordered: false, maxRetransmits: 0 });
   input = pc.createDataChannel('input', { ordered: true });
   move = pc.createDataChannel('move', { ordered: false, maxRetransmits: 0 });
   move.bufferedAmountLowThreshold = 0;
@@ -271,17 +272,56 @@ sourcesEl.onchange = () => { location.href = sourcesEl.value + location.search; 
 
 // ---- stats ----
 
-let prev;
+let prev, prevAudio, prevPlayout, statsChannel, outputCtx;
+// Per-interval average of a cumulative delay counter, in ms.
+const avgMs = (cur, old, delay, count) => {
+  const n = cur && old ? cur[count] - old[count] : 0;
+  return n > 0 ? ((cur[delay] - old[delay]) / n) * 1000 : NaN;
+};
 async function updateStats() {
   if (!pc) return;
   const r = await pc.getStats();
-  let v, pair;
+  let v, a, pair, playout;
   r.forEach((s) => {
     if (s.type === 'inbound-rtp' && s.kind === 'video') v = s;
+    if (s.type === 'inbound-rtp' && s.kind === 'audio') a = s;
+    if (s.type === 'media-playout') playout = s;
     if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
   });
   if (!v) return;
   const lines = [];
+  // Audio: jitter buffer, plus how long the output device takes to play a
+  // sample (media-playout where supported, else the AudioContext estimate).
+  outputCtx ??= new AudioContext();
+  const audio = {
+    jitbuf: avgMs(a, prevAudio, 'jitterBufferDelay', 'jitterBufferEmittedCount'),
+    target: avgMs(a, prevAudio, 'jitterBufferTargetDelay', 'jitterBufferEmittedCount'),
+    playout: avgMs(playout, prevPlayout, 'totalPlayoutDelay', 'totalSamplesCount'),
+    output: ((outputCtx.outputLatency || 0) + (outputCtx.baseLatency || 0)) * 1000,
+    stretched: a ? (a.insertedSamplesForDeceleration ?? 0) + (a.removedSamplesForAcceleration ?? 0) : 0,
+    concealed: a?.concealedSamples ?? 0,
+    codec: a ? r.get(a.codecId)?.mimeType : undefined,
+  };
+  const dt = prev ? (v.timestamp - prev.timestamp) / 1000 : NaN;
+  const video = {
+    fps: prev ? (v.framesDecoded - prev.framesDecoded) / dt : NaN,
+    received: prev ? (v.framesReceived - prev.framesReceived) / dt : NaN,
+    dropped: v.framesDropped,
+    mbps: prev ? ((v.bytesReceived - prev.bytesReceived) * 8) / dt / 1e6 : NaN,
+    nacks: v.nackCount, plis: v.pliCount, lost: v.packetsLost,
+    jitbuf: avgMs(v, prev, 'jitterBufferDelay', 'jitterBufferEmittedCount'),
+    decode: avgMs(v, prev, 'totalDecodeTime', 'framesDecoded'),
+    processing: avgMs(v, prev, 'totalProcessingDelay', 'framesDecoded'),
+  };
+  // estimatedPlayoutTimestamp maps what each track is playing now to the
+  // sender's clock; the difference is how far audio trails video.
+  const avOffset = a?.estimatedPlayoutTimestamp && v.estimatedPlayoutTimestamp
+    ? v.estimatedPlayoutTimestamp - a.estimatedPlayoutTimestamp : NaN;
+  if (statsChannel?.readyState === 'open') {
+    statsChannel.send(JSON.stringify({ video, audio, avOffset, rtt: pair?.currentRoundTripTime * 1000, ua: navigator.userAgent }));
+  }
+  prevAudio = a;
+  prevPlayout = playout;
   if (prev) {
     const dt = (v.timestamp - prev.timestamp) / 1000;
     const fps = (v.framesDecoded - prev.framesDecoded) / dt;
@@ -294,6 +334,7 @@ async function updateStats() {
     const codec = r.get(v.codecId)?.mimeType?.replace('video/', '') ?? '';
     lines.push(`${codec} ${v.frameWidth}×${v.frameHeight} ${fps.toFixed(0)}fps ${mbps.toFixed(1)}Mbps`);
     lines.push(`rtt ${rtt.toFixed(0)}ms  jitbuf ${jb.toFixed(0)}ms  dec ${dec.toFixed(1)}ms  lost ${v.packetsLost}`);
+    if (a) lines.push(`audio jitbuf ${audio.jitbuf.toFixed(0)}ms  out ${(Number.isNaN(audio.playout) ? audio.output : audio.playout).toFixed(0)}ms  a/v ${avOffset.toFixed(0)}ms`);
   }
   prev = v;
   if (probe) lines.push(probeStats());
