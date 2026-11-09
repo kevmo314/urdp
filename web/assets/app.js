@@ -67,8 +67,11 @@ async function negotiate(pc) {
   pc.ontrack = (e) => {
     // Render frames as soon as they decode instead of buffering for
     // smoothness; this is the single biggest client-side latency knob.
-    if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
-    if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = 0;
+    // In smooth mode, buffer both tracks by the same amount, which also keeps
+    // audio roughly in step with video.
+    const target = smooth ? SMOOTH_MS : 0;
+    if ('jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = target;
+    if ('playoutDelayHint' in e.receiver) e.receiver.playoutDelayHint = target / 1000;
     // Audio plays from its own element so the video element never waits on
     // (or gets re-initialized by) the audio track.
     if (e.track.kind === 'video') {
@@ -92,7 +95,11 @@ async function negotiate(pc) {
   };
   window.urdpPC = pc;
 
-  await pc.setLocalDescription(await pc.createOffer());
+  const offer = await pc.createOffer();
+  // Smooth mode leaves out the zero playout-delay extension so the
+  // browser's jitter buffer can even out frames that arrive in clumps.
+  if (smooth) offer.sdp = offer.sdp.replace(/^a=extmap:\d+ http:\/\/www\.webrtc\.org\/experiments\/rtp-hdrext\/playout-delay\r?\n/gm, '');
+  await pc.setLocalDescription(offer);
   await gatheringComplete(pc);
   const codec = new URLSearchParams(location.search).get('codec') ?? '';
   const res = await fetch(`/api/offer?source=${encodeURIComponent(source)}&codec=${encodeURIComponent(codec)}`, {
@@ -310,6 +317,17 @@ async function updateStats() {
     mbps: prev ? ((v.bytesReceived - prev.bytesReceived) * 8) / dt / 1e6 : NaN,
     nacks: v.nackCount, plis: v.pliCount, lost: v.packetsLost,
     jitbuf: avgMs(v, prev, 'jitterBufferDelay', 'jitterBufferEmittedCount'),
+    // Spread of the time between rendered frames (smoothness), and RTP
+    // interarrival jitter (network).
+    ...(() => {
+      const n = prev ? v.framesDecoded - prev.framesDecoded : 0;
+      if (n < 2 || v.totalInterFrameDelay == null) return {};
+      const sum = v.totalInterFrameDelay - prev.totalInterFrameDelay;
+      const sq = v.totalSquaredInterFrameDelay - prev.totalSquaredInterFrameDelay;
+      const mean = sum / n;
+      return { frameIntervalMs: mean * 1000, frameIntervalStdMs: Math.sqrt(Math.max(0, sq / n - mean * mean)) * 1000 };
+    })(),
+    rtpJitterMs: (v.jitter ?? NaN) * 1000,
     decode: avgMs(v, prev, 'totalDecodeTime', 'framesDecoded'),
     processing: avgMs(v, prev, 'totalProcessingDelay', 'framesDecoded'),
   };
@@ -622,6 +640,27 @@ window.addEventListener('pointermove', (e) => {
   if (!gate.hidden) return;
   hud.hidden = e.clientY > 48 && !hud.matches(':hover') && document.activeElement !== sourcesEl;
 });
+
+// ---- smooth mode ----
+// Off: frames render the moment they decode (lowest latency). On: the
+// browser buffers SMOOTH_MS so video plays evenly over a jittery network,
+// at that much extra latency. ?smooth in the URL turns it on.
+
+const SMOOTH_MS = 150;
+const smoothBtn = document.getElementById('smooth');
+let smooth = new URLSearchParams(location.search).has('smooth');
+try { smooth ||= localStorage.getItem('urdp.smooth') === '1'; } catch { /* storage unavailable */ }
+function showSmooth() {
+  smoothBtn.textContent = smooth ? 'Smooth' : 'Live';
+  smoothBtn.classList.toggle('on', smooth);
+}
+smoothBtn.onclick = () => {
+  smooth = !smooth;
+  try { localStorage.setItem('urdp.smooth', smooth ? '1' : '0'); } catch { /* storage unavailable */ }
+  showSmooth();
+  if (started) reconnect(); // the offer changes, so renegotiate
+};
+showSmooth();
 
 // ---- scaling ----
 // "fit" scales the stream to the window; "native" shows host pixels 1:1

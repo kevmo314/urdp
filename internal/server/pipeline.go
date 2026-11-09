@@ -3,6 +3,7 @@ package server
 import (
 	"errors"
 	"log"
+	"math"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -104,6 +105,9 @@ type pipelineStats struct {
 // frameCounts tallies the fate of each pass through the pipeline loop.
 type frameCounts struct {
 	Captures, Unchanged, CaptureErrors, EncodeErrors, Empty, Sent int
+	// Spread of the time between sent frames, in ms.
+	SendIntervalMs, SendIntervalStdMs float64
+	sum, sq                           float64
 }
 
 func newPipeline(id string, c encoder.Codec, src capture.Source, opts encoder.Options) (*pipeline, error) {
@@ -150,9 +154,15 @@ func (p *pipeline) run() {
 	packetizer := rtp.NewPacketizer(1200, 0, 0, lookupCodec(p.codec).payloader(), rtp.NewRandomSequencer(), 90000)
 	tsBase := rand.Uint32()
 	var counts, rates frameCounts
+	var lastSent time.Time
 	countStart := time.Now()
 	tally := func() {
 		if time.Since(countStart) >= time.Second {
+			if n := float64(counts.Sent - 1); n > 0 {
+				mean := counts.sum / n
+				counts.SendIntervalMs = mean
+				counts.SendIntervalStdMs = math.Sqrt(max(0, counts.sq/n-mean*mean))
+			}
 			rates, counts, countStart = counts, frameCounts{}, time.Now()
 			p.statsMu.Lock()
 			p.stats.Rates = rates
@@ -273,6 +283,12 @@ func (p *pipeline) run() {
 			counts.Empty++
 			continue
 		}
+		if !lastSent.IsZero() && counts.Sent > 0 {
+			d := float64(t0.Sub(lastSent).Microseconds()) / 1000
+			counts.sum += d
+			counts.sq += d * d
+		}
+		lastSent = t0
 		counts.Sent++
 		sentBytes += len(data)
 		ts := tsBase + uint32(t0.Sub(start)*90000/time.Second)
