@@ -124,7 +124,10 @@ func TestLibavD3D11Moving(t *testing.T) {
 	if s := os.Getenv("URDP_TEST_SIZE"); s != "" {
 		fmt.Sscanf(s, "%dx%d", &w, &h)
 	}
-	tex, err := d3dtest.New(w, h, moving(w, h, 0))
+	// URDP_TEST_MIP encodes from that mip level (capture's scaling).
+	mip := 0
+	fmt.Sscan(os.Getenv("URDP_TEST_MIP"), &mip)
+	tex, err := d3dtest.NewMips(w, h, mip+1, moving(w, h, 0))
 	if err != nil {
 		t.Skip(err)
 	}
@@ -142,11 +145,14 @@ func TestLibavD3D11Moving(t *testing.T) {
 	}
 	for _, mode := range []string{"gpu", "cpu"} {
 		t.Run(mode, func(t *testing.T) {
+			if mode == "cpu" && mip > 0 {
+				t.Skip("mip levels are GPU-only")
+			}
 			o := Options{FPS: 60, BitrateKbps: 50000}
 			if mode == "gpu" {
 				o.GPUDevice = capture.D3D11Device(tex.Device)
 			}
-			enc, err := newLibav(name, codec, opts, w, h, o)
+			enc, err := newLibav(name, codec, opts, w>>mip, h>>mip, o)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -160,7 +166,8 @@ func TestLibavD3D11Moving(t *testing.T) {
 				f := &capture.Frame{Width: w, Height: h}
 				if mode == "gpu" {
 					tex.Update(w, pix)
-					f.GPU = capture.D3D11Texture{Device: tex.Device, Texture: tex.Texture}
+					f.Width, f.Height = w>>mip, h>>mip
+					f.GPU = capture.D3D11Texture{Device: tex.Device, Texture: tex.Texture, Mip: mip}
 				} else {
 					f.Pix, f.Stride = pix, w*4
 				}

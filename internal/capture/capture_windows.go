@@ -86,7 +86,7 @@ func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	w, h, stride := int(image.w), int(image.h), int(image.stride)
 	switch {
 	case image.texture != nil:
-		s.frame = Frame{Width: w, Height: h, GPU: D3D11Texture{Device: image.device, Texture: image.texture}}
+		s.frame = Frame{Width: w, Height: h, GPU: D3D11Texture{Device: image.device, Texture: image.texture, Mip: int(image.mip)}}
 	case image.pixels != nil:
 		s.frame = Frame{
 			Pix:    unsafe.Slice((*byte)(unsafe.Pointer(image.pixels)), (h-1)*stride+w*4),
@@ -110,6 +110,17 @@ func (s *windowsSource) Capture(wait time.Duration) (*Frame, bool, error) {
 // Capture.
 type D3D11Texture struct {
 	Device, Texture unsafe.Pointer
+	// Mip is the mip level holding the frame when it's scaled down.
+	Mip int
+}
+
+// SetScale makes GPU frames 1/scale of the size in each dimension (1, 2
+// or 4), scaled on the GPU. It reports whether GPU frames will be scaled;
+// CPU frames always come at full size.
+func (s *windowsSource) SetScale(scale int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.native != nil && C.capture_set_scale(s.native, C.int(scale)) != 0
 }
 
 // SetGPUOutput switches between CPU pixels and D3D11Texture frames. Even

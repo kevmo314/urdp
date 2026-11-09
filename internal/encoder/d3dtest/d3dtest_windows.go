@@ -9,7 +9,7 @@ package d3dtest
 #include <d3d11.h>
 #include <stdlib.h>
 
-static long pattern(int w, int h, const unsigned char *bgra, void **device, void **texture) {
+static long pattern(int w, int h, int levels, const unsigned char *bgra, void **device, void **texture, void **srv) {
 	ID3D11Device *d = NULL;
 	ID3D11DeviceContext *c = NULL;
 	HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
@@ -20,13 +20,21 @@ static long pattern(int w, int h, const unsigned char *bgra, void **device, void
 		ID3D10Multithread_SetMultithreadProtected(mt, TRUE);
 		ID3D10Multithread_Release(mt);
 	}
-	D3D11_TEXTURE2D_DESC desc = {(UINT)w, (UINT)h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
-		D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
-	D3D11_SUBRESOURCE_DATA data = {bgra, (UINT)w * 4, 0};
+	D3D11_TEXTURE2D_DESC desc = {(UINT)w, (UINT)h, (UINT)levels, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
+		D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE | (levels > 1 ? D3D11_BIND_RENDER_TARGET : 0), 0,
+		levels > 1 ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0};
 	ID3D11Texture2D *t = NULL;
-	hr = ID3D11Device_CreateTexture2D(d, &desc, &data, &t);
+	hr = ID3D11Device_CreateTexture2D(d, &desc, NULL, &t);
+	if (SUCCEEDED(hr)) {
+		ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)t, 0, NULL, bgra, (UINT)w * 4, 0);
+		*srv = NULL;
+		if (levels > 1) {
+			hr = ID3D11Device_CreateShaderResourceView(d, (ID3D11Resource *)t, NULL, (ID3D11ShaderResourceView **)srv);
+			if (SUCCEEDED(hr)) ID3D11DeviceContext_GenerateMips(c, (ID3D11ShaderResourceView *)*srv);
+		}
+	}
 	ID3D11DeviceContext_Release(c);
-	if (FAILED(hr)) { ID3D11Device_Release(d); return hr; }
+	if (FAILED(hr)) { if (t) ID3D11Texture2D_Release(t); ID3D11Device_Release(d); return hr; }
 	*device = d;
 	*texture = t;
 	return 0;
@@ -34,10 +42,11 @@ static long pattern(int w, int h, const unsigned char *bgra, void **device, void
 static void release(void *p) { if (p) IUnknown_Release((IUnknown *)p); }
 // update rewrites the texture through the device's immediate context, as
 // capture does with CopySubresourceRegion.
-static void update(void *device, void *texture, int w, const unsigned char *bgra) {
+static void update(void *device, void *texture, void *srv, int w, const unsigned char *bgra) {
 	ID3D11DeviceContext *c = NULL;
 	ID3D11Device_GetImmediateContext((ID3D11Device *)device, &c);
 	ID3D11DeviceContext_UpdateSubresource(c, (ID3D11Resource *)texture, 0, NULL, bgra, (UINT)w * 4, 0);
+	if (srv) ID3D11DeviceContext_GenerateMips(c, (ID3D11ShaderResourceView *)srv);
 	ID3D11DeviceContext_Release(c);
 }
 */
@@ -51,28 +60,34 @@ import (
 // Texture is a BGRA texture on its own hardware device.
 type Texture struct {
 	Device, Texture unsafe.Pointer
+	srv             unsafe.Pointer
 }
 
 // New uploads w x h BGRA pixels into a texture on a new device.
-func New(w, h int, bgra []byte) (*Texture, error) {
+func New(w, h int, bgra []byte) (*Texture, error) { return NewMips(w, h, 1, bgra) }
+
+// NewMips is New with a mip chain of the given number of levels, kept
+// generated from level 0 (as capture does when scaling).
+func NewMips(w, h, levels int, bgra []byte) (*Texture, error) {
 	if len(bgra) < w*h*4 {
 		return nil, fmt.Errorf("d3dtest: need %d bytes", w*h*4)
 	}
 	cpix := C.CBytes(bgra)
 	defer C.free(cpix)
-	var d, t unsafe.Pointer
-	if hr := C.pattern(C.int(w), C.int(h), (*C.uchar)(cpix), &d, &t); hr != 0 {
+	var d, t, srv unsafe.Pointer
+	if hr := C.pattern(C.int(w), C.int(h), C.int(levels), (*C.uchar)(cpix), &d, &t, &srv); hr != 0 {
 		return nil, fmt.Errorf("d3dtest: HRESULT 0x%08x", uint32(hr))
 	}
-	return &Texture{Device: d, Texture: t}, nil
+	return &Texture{Device: d, Texture: t, srv: srv}, nil
 }
 
 // Update replaces the texture's pixels (w x h BGRA).
 func (t *Texture) Update(w int, bgra []byte) {
-	C.update(t.Device, t.Texture, C.int(w), (*C.uchar)(unsafe.Pointer(&bgra[0])))
+	C.update(t.Device, t.Texture, t.srv, C.int(w), (*C.uchar)(unsafe.Pointer(&bgra[0])))
 }
 
 func (t *Texture) Close() {
+	C.release(t.srv)
 	C.release(t.Texture)
 	C.release(t.Device)
 }

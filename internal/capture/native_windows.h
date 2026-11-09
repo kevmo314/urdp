@@ -31,6 +31,8 @@ typedef struct {
     unsigned char *pixels;
     int stride, w, h;
     void *texture, *device;
+    // mip is the texture's mip level holding the w x h image (scaling).
+    int mip;
     // When the frame was put on screen, in 100ns units of the
     // QueryPerformanceCounter clock (capture_now_100ns); 0 if unknown.
     int64_t present;
@@ -40,6 +42,10 @@ int64_t capture_now_100ns(void);
 // whether GPU mode is now on: it is refused when monitors span adapters.
 // Rotated monitors and fallback paths still produce CPU frames.
 int capture_set_gpu(capture_native *s, int on);
+// capture_set_scale makes GPU frames 1/scale of the size (1, 2 or 4), via
+// the texture's mip chain. It returns whether GPU frames will be scaled;
+// CPU frames are always full size.
+int capture_set_scale(capture_native *s, int scale);
 // capture_device is the ID3D11Device GPU textures will live on, or NULL.
 void *capture_device(capture_native *s);
 long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms);

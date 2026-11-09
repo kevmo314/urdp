@@ -63,6 +63,33 @@ func TestGPUOutput(t *testing.T) {
 			if kinds["gpu"] == 0 {
 				t.Log("no GPU frames: the screen may not have changed during the test")
 			}
+			// Scaled GPU frames come from the texture's mip chain; the
+			// bounds (for input mapping) stay full size.
+			sc := src.(interface{ SetScale(int) bool })
+			for _, scale := range []int{2, 4, 1} {
+				if !sc.SetScale(scale) {
+					t.Fatalf("SetScale(%d) refused in GPU mode", scale)
+				}
+				var f *Frame
+				for i := 0; i < 20; i++ {
+					if f, _, err = src.Capture(30 * time.Millisecond); err != nil {
+						t.Fatal(err)
+					}
+					if f.GPU != nil {
+						break
+					}
+				}
+				tex, ok := f.GPU.(D3D11Texture)
+				if !ok {
+					t.Logf("scale %d: no GPU frame yet (static screen)", scale)
+					continue
+				}
+				wantMip := map[int]int{1: 0, 2: 1, 4: 2}[scale]
+				if tex.Mip != wantMip || f.Width != b.Dx()/scale || f.Height != b.Dy()/scale || src.Bounds() != b {
+					t.Fatalf("scale %d: mip %d, %dx%d, bounds %v (want mip %d, %dx%d, %v)", scale, tex.Mip, f.Width, f.Height, src.Bounds(), wantMip, b.Dx()/scale, b.Dy()/scale, b)
+				}
+				t.Logf("scale %d: %dx%d from mip %d", scale, f.Width, f.Height, tex.Mip)
+			}
 			if err := g.SetGPUOutput(false); err != nil {
 				t.Fatal(err)
 			}

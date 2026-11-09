@@ -50,14 +50,15 @@ static int next_frame(AVCodecContext *c, AVFrame *hw) {
 	return av_hwframe_get_buffer(c->hw_frames_ctx, hw, 0);
 }
 
-// copy_texture copies the top-left w x h of a capture texture into hw.
-static void copy_texture(AVCodecContext *c, AVFrame *hw, void *texture) {
+// copy_texture copies the top-left w x h of a capture texture's mip level
+// into hw.
+static void copy_texture(AVCodecContext *c, AVFrame *hw, void *texture, int mip) {
 	AVHWFramesContext *fc = (AVHWFramesContext *)c->hw_frames_ctx->data;
 	AVD3D11VADeviceContext *d = fc->device_ctx->hwctx;
 	D3D11_BOX box = {0, 0, 0, (UINT)c->width, (UINT)c->height, 1};
 	d->lock(d->lock_ctx);
 	ID3D11DeviceContext_CopySubresourceRegion(d->device_context, (ID3D11Resource *)hw->data[0],
-		(UINT)(intptr_t)hw->data[1], 0, 0, 0, (ID3D11Resource *)texture, 0, &box);
+		(UINT)(intptr_t)hw->data[1], 0, 0, 0, (ID3D11Resource *)texture, (UINT)mip, &box);
 	d->unlock(d->lock_ctx);
 }
 
@@ -114,7 +115,7 @@ func (e *libavEncoder) sendGPU(f *capture.Frame, ptsMs int64, keyframe bool) err
 		if capture.D3D11Device(t.Device) != e.device {
 			return fmt.Errorf("%w: capture GPU device changed", ErrReopen)
 		}
-		C.copy_texture(e.ctx, e.hw, t.Texture)
+		C.copy_texture(e.ctx, e.hw, t.Texture, C.int(t.Mip))
 	case f.Pix != nil:
 		if e.bgra == nil {
 			if e.bgra = C.alloc_bgra(C.int(e.w), C.int(e.h)); e.bgra == nil {

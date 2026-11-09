@@ -153,6 +153,44 @@ func (p *pipeline) run() {
 	// the wrong frame and inflates the receiver's jitter estimate.)
 	packetizer := rtp.NewPacketizer(1200, 0, 0, lookupCodec(p.codec).payloader(), rtp.NewRandomSequencer(), 90000)
 	tsBase := rand.Uint32()
+	var res resScaler
+	scale, srcScale := 1, 1 // chosen divisor; the one the source applies to GPU frames
+	var scaled capture.Frame
+	// applyCapture picks the capture format for the encoder and scale: GPU
+	// frames (zero-copy) only once a backend that takes them is open, so a
+	// software fallback keeps getting CPU pixels, and only if the source can
+	// also scale them on the GPU; otherwise CPU frames scaled here. The
+	// current frame stays valid.
+	applyCapture := func() {
+		gs, hasGPU := p.src.(interface{ SetGPUOutput(bool) error })
+		sc, hasScale := p.src.(interface{ SetScale(int) bool })
+		gpu := hasGPU && enc != nil && acceptsGPU(enc)
+		if gpu {
+			// On failure capture keeps its old format: GPU-capable
+			// encoders take CPU frames too, and GPU-only frames are
+			// skipped below for the rest.
+			if err := gs.SetGPUOutput(true); err != nil {
+				log.Printf("source %s: capture format: %v", p.id, err)
+				gpu = false
+			}
+		}
+		srcScale = 1
+		if hasScale {
+			if sc.SetScale(scale) && gpu {
+				srcScale = scale
+			} else if scale > 1 {
+				sc.SetScale(1)
+				gpu = false // GPU frames can't be scaled here: use CPU frames
+			}
+		} else if scale > 1 {
+			gpu = false
+		}
+		if hasGPU && !gpu {
+			if err := gs.SetGPUOutput(false); err != nil {
+				log.Printf("source %s: capture format: %v", p.id, err)
+			}
+		}
+	}
 	var counts, rates frameCounts
 	var lastStamp time.Time
 	countStart := time.Now()
@@ -213,6 +251,27 @@ func (p *pipeline) run() {
 		timer.Reset(interval - time.Since(grabbed))
 		t1 := time.Now()
 
+		// Resolution scaling: when the bitrate can't carry the full
+		// picture, send 1/4 or 1/16 of the pixels and let the viewer scale
+		// it up (see resScaler).
+		fs := 1 // how much smaller than the source this frame already is
+		if f.GPU != nil {
+			fs = srcScale
+		}
+		if next := res.update(t1, f.Width*fs, f.Height*fs, kbps*1000); next != scale {
+			log.Printf("source %s: resolution 1/%d (%d kbps for %dx%d)", p.id, next*next, kbps, f.Width*fs, f.Height*fs)
+			scale = next
+			applyCapture()
+			p.keyframe.Store(true)
+			continue // this frame is at the old scale
+		}
+		switch {
+		case f.GPU != nil && fs != scale:
+			continue // captured before the source switched scale
+		case f.Pix != nil && scale > 1:
+			capture.Downscale(f, scale, &scaled)
+			f = &scaled
+		}
 		if enc != nil {
 			if ew, eh := enc.Size(); ew != f.Width&^1 || eh != f.Height&^1 {
 				enc.Close()
@@ -239,17 +298,7 @@ func (p *pipeline) run() {
 				continue
 			}
 			lastOpenErr = ""
-			// Let capture hand over GPU frames (zero-copy) only once the
-			// backend that will take them is open, so a software fallback
-			// keeps getting CPU pixels. The current frame stays valid.
-			if src, ok := p.src.(interface{ SetGPUOutput(bool) error }); ok {
-				// On failure capture keeps its old format: GPU-capable
-				// encoders take CPU frames too, and GPU-only frames are
-				// skipped below for the rest.
-				if err := src.SetGPUOutput(acceptsGPU(enc)); err != nil {
-					log.Printf("source %s: capture format: %v", p.id, err)
-				}
-			}
+			applyCapture()
 			p.keyframe.Store(true)
 		}
 		// Right after switching back from GPU output the source may still

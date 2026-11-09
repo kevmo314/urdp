@@ -38,6 +38,8 @@ struct capture_native {
     ID3D11Device *shared;
     ID3D11Query *done; // signals when queued GPU copies have finished
     int64_t present;   // when the current image was put on screen (capture_now_100ns clock)
+    int scale;         // GPU frames are 1/scale of the size, from gpu's mip chain
+    ID3D11ShaderResourceView *srv; // of gpu, for GenerateMips
     unsigned char *metadata;
     UINT metadata_size;
     HDC dc;
@@ -54,6 +56,31 @@ struct capture_native {
         }                                                                                          \
     } while (0)
 #define HAS_IMAGE(s) ((s)->image.pixels || (s)->image.texture)
+static int mip_level(int scale) { return scale >= 4 ? 2 : scale >= 2 ? 1 : 0; }
+// Mip chains need a render target and a view to generate from.
+static HRESULT create_gpu_texture(capture_native *s, D3D11_TEXTURE2D_DESC desc) {
+    int level = mip_level(s->scale);
+    desc.MipLevels = level + 1;
+    desc.ArraySize = 1;
+    desc.SampleDesc = (DXGI_SAMPLE_DESC){1, 0};
+    desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | (level ? D3D11_BIND_RENDER_TARGET : 0);
+    desc.CPUAccessFlags = 0;
+    desc.MiscFlags = level ? D3D11_RESOURCE_MISC_GENERATE_MIPS : 0;
+    RELEASE(s->srv);
+    RELEASE(s->gpu);
+    HRESULT hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, &s->gpu);
+    if (SUCCEEDED(hr) && level)
+        hr = ID3D11Device_CreateShaderResourceView(s->device, (ID3D11Resource *)s->gpu, NULL, &s->srv);
+    return hr;
+}
+// gpu_image publishes gpu (at the scaled mip level) as the current image.
+static void gpu_image(capture_native *s) {
+    int level = mip_level(s->scale);
+    if (level && s->srv)
+        ID3D11DeviceContext_GenerateMips(s->context, s->srv);
+    s->image = (capture_image){NULL, 0, s->rect.w >> level, s->rect.h >> level, s->gpu, s->device, level};
+}
 static int64_t qpc_to_100ns(int64_t qpc) {
     static LARGE_INTEGER freq;
     if (!freq.QuadPart)
@@ -216,8 +243,8 @@ long capture_bounds(capture_native *s, capture_rect *r) {
         return hr;
     *r = s->rect;
     if (s->hwnd && HAS_IMAGE(s)) {
-        r->w = s->image.w;
-        r->h = s->image.h;
+        r->w = s->image.w << s->image.mip;
+        r->h = s->image.h << s->image.mip;
     }
     return S_OK;
 }
@@ -292,10 +319,9 @@ static HRESULT composite_bounds(capture_native *s, int force, int *reset) {
     int have = s->gpu_mode ? s->gpu != NULL : s->composite != NULL;
     *reset = force || !have || memcmp(&r, &s->rect, sizeof(r));
     if (*reset && s->gpu_mode) {
-        RELEASE(s->gpu);
         D3D11_TEXTURE2D_DESC desc = {(UINT)r.w, (UINT)r.h, 1, 1, DXGI_FORMAT_B8G8R8A8_UNORM, {1, 0},
                                      D3D11_USAGE_DEFAULT, D3D11_BIND_SHADER_RESOURCE, 0, 0};
-        HRESULT hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, &s->gpu);
+        HRESULT hr = create_gpu_texture(s, desc);
         if (FAILED(hr))
             return hr;
         // Monitors needn't tile the bounding box; keep the gaps black.
@@ -319,7 +345,7 @@ static HRESULT composite_bounds(capture_native *s, int force, int *reset) {
         s->rect = r;
     }
     if (s->gpu_mode)
-        s->image = (capture_image){NULL, 0, r.w, r.h, s->gpu, s->device};
+        gpu_image(s);
     else
         s->image = (capture_image){s->composite, r.w * 4, r.w, r.h};
     return S_OK;
@@ -465,13 +491,15 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
     int full = !*target;
     s->move_bytes = s->dirty_bytes = 0;
     HRESULT hr = S_OK;
-    if (!*target) {
+    if (!*target && gpu) {
+        hr = create_gpu_texture(s, desc);
+    } else if (!*target) {
         desc.MipLevels = 1;
         desc.ArraySize = 1;
         desc.SampleDesc = (DXGI_SAMPLE_DESC){1, 0};
-        desc.Usage = gpu ? D3D11_USAGE_DEFAULT : D3D11_USAGE_STAGING;
-        desc.BindFlags = gpu ? D3D11_BIND_SHADER_RESOURCE : 0;
-        desc.CPUAccessFlags = gpu ? 0 : D3D11_CPU_ACCESS_READ;
+        desc.Usage = D3D11_USAGE_STAGING;
+        desc.BindFlags = 0;
+        desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
         desc.MiscFlags = 0;
         hr = ID3D11Device_CreateTexture2D(s->device, &desc, NULL, target);
     }
@@ -515,8 +543,8 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
         ID3D11DeviceContext_CopyResource(s->context, dst, (ID3D11Resource *)texture);
     s->full_update = full || box != NULL;
     if (gpu) {
+        gpu_image(s);
         gpu_wait(s->device, s->context, &s->done);
-        s->image = (capture_image){NULL, 0, s->rect.w, s->rect.h, s->gpu, s->device};
         return S_OK;
     }
     D3D11_MAPPED_SUBRESOURCE map;
@@ -755,8 +783,11 @@ static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms) {
             o->move_bytes = o->dirty_bytes = 0;
         }
         s->next_output = (s->next_output + 1) % s->output_count;
-        if (changed)
+        if (changed) {
+            if (s->gpu_mode)
+                gpu_image(s); // the canvas changed: refresh its scaled level
             return S_OK;
+        }
         QueryPerformanceCounter(&now);
         if ((now.QuadPart - start.QuadPart) * 1000 >= (LONGLONG)timeout_ms * frequency.QuadPart)
             return S_FALSE;
@@ -784,6 +815,7 @@ void capture_close(capture_native *s) {
     capture_wgc_close(s->wgc);
     unmap(s);
     RELEASE(s->staging);
+    RELEASE(s->srv);
     RELEASE(s->gpu);
     RELEASE(s->done);
     RELEASE(s->dup);
@@ -850,6 +882,7 @@ void capture_free(void *p) {
 static void reset_frames(capture_native *s, int on) {
     unmap(s);
     RELEASE(s->staging);
+    RELEASE(s->srv);
     RELEASE(s->gpu);
     s->image = (capture_image){0};
     s->gpu_mode = on;
@@ -873,3 +906,18 @@ int capture_set_gpu(capture_native *s, int on) {
     return on;
 }
 void *capture_device(capture_native *s) { return s->device; }
+
+int capture_set_scale(capture_native *s, int scale) {
+    scale = scale >= 4 ? 4 : scale >= 2 ? 2 : 1;
+    if (s->scale != scale) {
+        // Recreate the GPU texture with the right mip chain; the next frame
+        // is a full one. Monitors of a composite stay full size: only the
+        // canvas is scaled.
+        s->scale = scale;
+        RELEASE(s->srv);
+        RELEASE(s->gpu);
+        if (s->gpu_mode)
+            s->image = (capture_image){0};
+    }
+    return s->gpu_mode || scale == 1;
+}
