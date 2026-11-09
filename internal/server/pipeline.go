@@ -94,8 +94,16 @@ type pipelineStats struct {
 	Width, Height int
 	CaptureMs     float64
 	EncodeMs      float64
+	SendMs        float64
 	Bytes         int
 	BitrateKbps   int
+	// Per second, over the last second: what happened to each capture.
+	Rates frameCounts
+}
+
+// frameCounts tallies the fate of each pass through the pipeline loop.
+type frameCounts struct {
+	Captures, Unchanged, CaptureErrors, EncodeErrors, Empty, Sent int
 }
 
 func newPipeline(id string, c encoder.Codec, src capture.Source, opts encoder.Options) (*pipeline, error) {
@@ -141,6 +149,16 @@ func (p *pipeline) run() {
 	// the wrong frame and inflates the receiver's jitter estimate.)
 	packetizer := rtp.NewPacketizer(1200, 0, 0, lookupCodec(p.codec).payloader(), rtp.NewRandomSequencer(), 90000)
 	tsBase := rand.Uint32()
+	var counts, rates frameCounts
+	countStart := time.Now()
+	tally := func() {
+		if time.Since(countStart) >= time.Second {
+			rates, counts, countStart = counts, frameCounts{}, time.Now()
+			p.statsMu.Lock()
+			p.stats.Rates = rates
+			p.statsMu.Unlock()
+		}
+	}
 
 	for {
 		select {
@@ -152,21 +170,25 @@ func (p *pipeline) run() {
 		// Sources that block in Capture until the screen updates hand
 		// frames over the moment they're presented; the timer below only
 		// enforces the frame-rate cap after a frame has been produced.
+		tally()
 		captureStart := time.Now()
 		f, changed, err := p.src.Capture(interval)
 		t0 := time.Now()
+		counts.Captures++
 		if errors.Is(err, capture.ErrNotFound) {
 			log.Printf("source %s: window gone", p.id)
 			return
 		}
 		if err != nil {
 			log.Printf("source %s: capture: %v", p.id, err)
+			counts.CaptureErrors++
 			timer.Reset(interval)
 			continue
 		}
 		// Nothing new on screen: send nothing rather than re-encode an
 		// identical picture, unless a viewer needs a keyframe.
 		if !changed && !p.keyframe.Load() {
+			counts.Unchanged++
 			timer.Reset(0)
 			continue
 		}
@@ -239,6 +261,7 @@ func (p *pipeline) run() {
 		data, _, err := enc.Encode(f, t0.Sub(start).Milliseconds(), p.keyframe.Swap(false))
 		if err != nil {
 			log.Printf("source %s: encode: %v", p.id, err)
+			counts.EncodeErrors++
 			if errors.Is(err, encoder.ErrReopen) {
 				enc.Close()
 				enc = nil
@@ -247,8 +270,10 @@ func (p *pipeline) run() {
 		}
 		t2 := time.Now()
 		if len(data) == 0 {
+			counts.Empty++
 			continue
 		}
+		counts.Sent++
 		sentBytes += len(data)
 		ts := tsBase + uint32(t0.Sub(start)*90000/time.Second)
 		for _, pkt := range packetizer.Packetize(data, 0) {
@@ -258,10 +283,12 @@ func (p *pipeline) run() {
 			_ = p.track.WriteRTP(pkt)
 		}
 
+		t3 := time.Now()
 		ew, eh := enc.Size()
 		p.statsMu.Lock()
 		p.stats = pipelineStats{
-			Width: ew, Height: eh,
+			Width: ew, Height: eh, Rates: rates,
+			SendMs:      float64(t3.Sub(t2).Microseconds()) / 1000,
 			CaptureMs:   float64(t0.Sub(captureStart).Microseconds()) / 1000, // includes waiting for an update
 			EncodeMs:    float64(t2.Sub(t1).Microseconds()) / 1000,
 			Bytes:       len(data),

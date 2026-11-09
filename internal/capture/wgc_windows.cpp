@@ -108,6 +108,10 @@ static HRESULT factory(const wchar_t *name, REFIID iid, void **out) {
     WindowsDeleteString(str);
     return hr;
 }
+// Buffers DWM can render into while one is being copied; with only two, a
+// frame checked out by us left one, and bursts of window updates dropped.
+static const int wgc_buffers = 3;
+
 extern "C" HRESULT capture_wgc_open(HWND hwnd, ID3D11Device *device, capture_wgc **out) {
     Apartment apartment;
     if (FAILED(apartment.hr))
@@ -142,7 +146,7 @@ extern "C" HRESULT capture_wgc_open(HWND hwnd, ID3D11Device *device, capture_wgc
             factory(L"Windows.Graphics.Capture.Direct3D11CaptureFramePool", IID_PPV_ARGS(&statics));
     if (SUCCEEDED(hr))
         hr = statics->CreateFreeThreaded(s->device.Get(), DirectXPixelFormat_B8G8R8A8UIntNormalized,
-                                         2, s->size, &s->pool);
+                                         wgc_buffers, s->size, &s->pool);
     if (SUCCEEDED(hr))
         hr = s->pool->CreateCaptureSession(s->item.Get(), &s->session);
     if (SUCCEEDED(hr)) {
@@ -215,7 +219,7 @@ extern "C" HRESULT capture_wgc_frame(capture_wgc *s, unsigned int timeout_ms,
         s->size = size;
         if (size.Width <= 0 || size.Height <= 0)
             return S_FALSE;
-        hr = s->pool->Recreate(s->device.Get(), DirectXPixelFormat_B8G8R8A8UIntNormalized, 2, size);
+        hr = s->pool->Recreate(s->device.Get(), DirectXPixelFormat_B8G8R8A8UIntNormalized, wgc_buffers, size);
         return FAILED(hr) ? hr : S_FALSE;
     }
     ComPtr<D3D::IDirect3DSurface> surface;
@@ -244,12 +248,18 @@ extern "C" HRESULT capture_wgc_frame(capture_wgc *s, unsigned int timeout_ms,
         } else if (SUCCEEDED(hr))
             hr = E_FAIL;
     }
-    // Keep the pool buffer checked out until the next Capture, after readback.
+    // Keep the pool buffer checked out until it has been copied; the caller
+    // hands it back with capture_wgc_release as soon as it has.
     if (hr == S_OK)
         s->held = frame;
     else
         close_object(frame.Get());
     return hr;
+}
+extern "C" void capture_wgc_release(capture_wgc *s) {
+    Apartment apartment;
+    close_object(s->held.Get());
+    s->held.Reset();
 }
 extern "C" void capture_wgc_close(capture_wgc *s) {
     Apartment apartment;

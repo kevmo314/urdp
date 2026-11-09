@@ -590,6 +590,10 @@ long capture_frame(capture_native *s, capture_image *image, unsigned int timeout
                 hr = texture_frame(s, texture, &box, NULL);
             }
             RELEASE(texture);
+            // texture_frame has copied it (GPU mode waits for the copy;
+            // CPU mode maps the result), so DWM can reuse the buffer.
+            if (s->wgc)
+                capture_wgc_release(s->wgc);
             if (FAILED(hr)) {
                 // A stopped compositor/device must not leave a permanently broken source.
                 capture_wgc_close(s->wgc);
