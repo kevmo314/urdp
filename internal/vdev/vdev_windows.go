@@ -168,7 +168,7 @@ func openGamepad() (Gamepad, error) {
 	var native *C.pad_native
 	if code := C.pad_open(&native); code != 0 {
 		if code == 1168 {
-			return nil, fmt.Errorf("%w: install ViGEmBus (https://github.com/nefarius/ViGEmBus/releases)", ErrUnsupported)
+			return nil, fmt.Errorf("%w: ViGEmBus is not installed; on the host run urdp.exe -install-drivers (or install ViGEmBus from https://github.com/nefarius/ViGEmBus/releases)", ErrUnsupported)
 		}
 		return nil, fmt.Errorf("ViGEmBus: open (Windows error %d); install or repair ViGEmBus (https://github.com/nefarius/ViGEmBus/releases)", uint32(code))
 	}

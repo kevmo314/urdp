@@ -44,6 +44,10 @@ func main() {
 	)
 	flag.Parse()
 
+	if platformCommand() {
+		return
+	}
+
 	if *list {
 		wins, err := capture.List()
 		if err != nil {
