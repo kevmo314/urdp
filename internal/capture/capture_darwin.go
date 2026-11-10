@@ -65,7 +65,7 @@ func enumeration(displays bool, out any) error {
 	defer C.free(unsafe.Pointer(p))
 	return json.Unmarshal([]byte(C.GoString(p)), out)
 }
-func listWindows() (out []Window, err error)   { err = enumeration(false, &out); return }
+func listWindows() (out []Window, err error) { err = enumeration(false, &out); return }
 func listDisplays() (out []Display, err error) {
 	// An empty list usually means the display is asleep: wake it and look
 	// again for up to a couple of seconds.
