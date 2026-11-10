@@ -11,7 +11,7 @@ void ur_wait(uint64_t, double);
 char *ur_list(int, char **);
 void *ur_open(uint32_t, int, char **);
 int ur_gpu_output(void *, int, char **);
-int ur_frame(void *, double, void **, void **, int *, int *, int *, double *, char **);
+int ur_frame(void *, double, void **, void **, int *, int *, int *, double *, double *, char **);
 void ur_close(void *);
 int ur_icon(uint32_t, int, unsigned char *);
 */
@@ -38,6 +38,8 @@ type darwinSource struct {
 	bounds image.Rectangle
 	frame  Frame
 	first  bool
+	// release ends this source's hold on keeping the display awake.
+	release func()
 }
 
 func nativeError(p *C.char) error {
@@ -64,7 +66,17 @@ func enumeration(displays bool, out any) error {
 	return json.Unmarshal([]byte(C.GoString(p)), out)
 }
 func listWindows() (out []Window, err error)   { err = enumeration(false, &out); return }
-func listDisplays() (out []Display, err error) { err = enumeration(true, &out); return }
+func listDisplays() (out []Display, err error) {
+	// An empty list usually means the display is asleep: wake it and look
+	// again for up to a couple of seconds.
+	for i := 0; ; i++ {
+		if err = enumeration(true, &out); err != nil || len(out) > 0 || i == 8 {
+			return
+		}
+		wakeDisplay()
+		time.Sleep(250 * time.Millisecond)
+	}
+}
 func openWindow(id uint64) (Source, error) {
 	if id == 0 || id > 1<<32-1 {
 		return nil, ErrNotFound
@@ -73,12 +85,14 @@ func openWindow(id uint64) (Source, error) {
 }
 func openDisplay(i int) (Source, error) { return openDarwin(0, i) }
 func openDarwin(id uint64, display int) (Source, error) {
+	release := keepAwake()
 	var e *C.char
 	p := C.ur_open(C.uint32_t(id), C.int(display), &e)
 	if p == nil {
+		release()
 		return nil, nativeError(e)
 	}
-	s := &darwinSource{native: p, id: id}
+	s := &darwinSource{native: p, id: id, release: release}
 	// Prime the source so Bounds and the first frame are available immediately.
 	if _, _, err := s.Capture(3 * time.Second); err != nil {
 		s.Close()
@@ -97,7 +111,8 @@ func (s *darwinSource) Capture(wait time.Duration) (*Frame, bool, error) {
 	var w, h, stride C.int
 	var r [4]C.double
 	var e *C.char
-	n := C.ur_frame(s.native, C.double(max(0, wait.Seconds())), &p, &gpu, &w, &h, &stride, &r[0], &e)
+	var age C.double
+	n := C.ur_frame(s.native, C.double(max(0, wait.Seconds())), &p, &gpu, &w, &h, &stride, &r[0], &age, &e)
 	if n == -2 {
 		return nil, false, ErrNotFound
 	}
@@ -113,6 +128,10 @@ func (s *darwinSource) Capture(wait time.Duration) (*Frame, bool, error) {
 		s.frame.GPU = DarwinPixelBuffer{Pointer: gpu}
 	} else {
 		s.frame.Pix = unsafe.Slice((*byte)(p), int(stride)*int(h))
+	}
+	// Stamp the frame with when ScreenCaptureKit says it was displayed.
+	if a := time.Duration(float64(age) * float64(time.Second)); age >= 0 && a < time.Second {
+		s.frame.Time = time.Now().Add(-a)
 	}
 	changed := n > 0 || s.first
 	s.first = false
@@ -143,6 +162,10 @@ func (s *darwinSource) Close() error {
 	defer s.mu.Unlock()
 	C.ur_close(s.native)
 	s.native = nil
+	if s.release != nil {
+		s.release()
+		s.release = nil
+	}
 	return nil
 }
 func windowIcon(id uint64, size int) (image.Image, error) {
@@ -217,6 +240,9 @@ func (s *darwinDesktop) Capture(wait time.Duration) (*Frame, bool, error) {
 				continue
 			}
 			changed = true
+			if f.Time.After(s.frame.Time) {
+				s.frame.Time = f.Time
+			}
 			r := src.Bounds().Sub(s.bounds.Min)
 			for y := 0; y < r.Dy(); y++ {
 				sy := y * f.Height / r.Dy()

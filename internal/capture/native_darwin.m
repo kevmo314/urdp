@@ -1,3 +1,4 @@
+#include <mach/mach_time.h>
 #import <AppKit/AppKit.h>
 #import <CoreMedia/CoreMedia.h>
 #import <ScreenCaptureKit/ScreenCaptureKit.h>
@@ -45,6 +46,9 @@ void ur_wait(uint64_t previous, double seconds) {
 @property NSCondition *condition;
 @property NSString *failure;
 @property CVPixelBufferRef pending;
+// When the pending and held frames were displayed (mach_absolute_time).
+@property uint64_t pendingTime;
+@property uint64_t heldTime;
 @property CVPixelBufferRef held;
 @property CGRect bounds;
 @property uint32_t windowID;
@@ -86,6 +90,8 @@ void ur_wait(uint64_t previous, double seconds) {
   if (self.pending)
     CVPixelBufferRelease(self.pending);
   self.pending = self.closed ? NULL : CVPixelBufferRetain(pixel);
+  NSNumber *shown = attachments.firstObject[SCStreamFrameInfoDisplayTime];
+  self.pendingTime = shown ? shown.unsignedLongLongValue : mach_absolute_time();
   [self.condition broadcast];
   notifyUpdate();
   [self.condition unlock];
@@ -341,7 +347,8 @@ int ur_gpu_output(void *ptr, int enabled, char **err) {
 }
 // Returns -2 when a window disappears, -1 on error, 0 on timeout, 1 on change.
 int ur_frame(void *ptr, double wait, void **pixels, void **gpu, int *width,
-             int *height, int *stride, double *bounds, char **err) {
+             int *height, int *stride, double *bounds, double *age,
+             char **err) {
   @autoreleasepool {
     URCapture *s = (__bridge URCapture *)ptr;
     if (s.windowID) {
@@ -393,6 +400,7 @@ int ur_frame(void *ptr, double wait, void **pixels, void **gpu, int *width,
         CVPixelBufferRelease(s.held);
       }
       s.held = s.pending;
+      s.heldTime = s.pendingTime;
       s.pending = NULL;
     }
     if (s.held) {
@@ -419,6 +427,16 @@ int ur_frame(void *ptr, double wait, void **pixels, void **gpu, int *width,
       *width = (int)CVPixelBufferGetWidth(s.held);
       *height = (int)CVPixelBufferGetHeight(s.held);
       *stride = (int)CVPixelBufferGetBytesPerRow(s.held);
+    }
+    // How long ago the held frame was on screen, in seconds.
+    *age = -1;
+    if (s.heldTime) {
+      static mach_timebase_info_data_t tb;
+      if (!tb.denom)
+        mach_timebase_info(&tb);
+      uint64_t now = mach_absolute_time();
+      if (now >= s.heldTime)
+        *age = (double)(now - s.heldTime) * tb.numer / tb.denom / 1e9;
     }
     bounds[0] = s.bounds.origin.x;
     bounds[1] = s.bounds.origin.y;
