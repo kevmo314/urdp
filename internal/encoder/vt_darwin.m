@@ -25,13 +25,17 @@ struct ur_vt {
 };
 
 // Hardware only. kVTVideoEncoderSpecification_EnableLowLatencyRateControl
-// is deliberately not used: measured on an M1 (macOS 27) it ignores
-// DataRateLimits, so a keyframe can come out at 40x the per-frame budget
-// (164 KB at 2 Mbit/s 1080p60), after which it drops up to 3 of every 4
-// frames to pay the debt back; it also rejects MaxFrameDelayCount and
-// PrioritizeEncodingSpeedOverQuality. The regular real-time encoder below
-// is as fast per frame, returns every frame synchronously, never dropped a
-// frame in testing, and keeps keyframes within the rate limit.
+// (Apple's "low-latency" mode) is deliberately not used. It selects a
+// different encoder (the conferencing one: it exposes LTR, temporal layers,
+// periodic intra refresh and frame dropping, and rejects MaxFrameDelayCount,
+// PrioritizeEncodingSpeedOverQuality, ConstantBitRate and VBV settings), but
+// its latency win is removing frame reordering and buffering, which RealTime
+// + no reordering + CompleteFrames per frame already give us. Measured on an
+// M1 (macOS 27) with scrolling 1080p60 text (TestVideoToolboxRateBench):
+// encode time was no better (7.5ms vs 6.9ms per frame), keyframes were as
+// large or larger (both modes put 25-50x the per-frame budget into a
+// keyframe at 2 Mbit/s; neither caps them), and only low-latency mode then
+// dropped frames (29 of 600) to pay the overshoot back.
 static NSDictionary *specification(void) {
   return @{
     (__bridge NSString *)
