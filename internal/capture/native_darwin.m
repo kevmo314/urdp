@@ -160,7 +160,8 @@ char *ur_list(int displays, char **err) {
           @"y" : @(r.origin.y),
           @"width" : @(r.size.width),
           @"height" : @(r.size.height),
-          @"primary" : @(d.displayID == CGMainDisplayID())
+          // A BOOL boxes as a JSON boolean; a comparison (int) as a number.
+          @"primary" : @((BOOL)(d.displayID == CGMainDisplayID()))
         }];
       }
     } else
