@@ -1,0 +1,34 @@
+name: urdp
+options:
+  bundleIdPrefix: com.okaericommunications
+  deploymentTarget:
+    tvOS: "17.0"
+  createIntermediateGroups: true
+packages:
+  LiveKitWebRTC:
+    url: https://github.com/livekit/webrtc-xcframework
+    exactVersion: 150.7871.08
+settings:
+  base:
+    DEVELOPMENT_TEAM: 66FGZV449C
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  urdp:
+    type: application
+    platform: tvOS
+    sources:
+      - path: urdp
+    dependencies:
+      - package: LiveKitWebRTC
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.okaericommunications.urdp
+        PRODUCT_NAME: urdp
+        INFOPLIST_FILE: urdp/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: "App Icon & Top Shelf Image"
+        CODE_SIGN_STYLE: Automatic
+        TARGETED_DEVICE_FAMILY: "3"
+        # LiveKitWebRTC's simulator slice is arm64 only.
+        EXCLUDED_ARCHS[sdk=appletvsimulator*]: x86_64
