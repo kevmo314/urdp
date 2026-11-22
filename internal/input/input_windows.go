@@ -1,10 +1,12 @@
 package input
 
 /*
+#cgo windows CFLAGS: -I${SRCDIR}/../windesk
 #cgo windows LDFLAGS: -luser32
 #define WIN32_LEAN_AND_MEAN
 #include <stdint.h>
 #include <windows.h>
+#include "windesk.h"
 static void input_dpi(void) {
     typedef BOOL(WINAPI * dpi_fn)(HANDLE);
     dpi_fn fn =
@@ -12,12 +14,16 @@ static void input_dpi(void) {
     if (fn)
         fn((HANDLE)(intptr_t)-4);
 }
+// Injection goes to the desktop the calling thread is on, so each call
+// joins the input desktop first: with urdp running as SYSTEM that lets
+// input reach UAC's secure prompt and the lock screen (see windesk.h).
 static DWORD input_move(int x, int y) {
-    if (SetCursorPos(x, y))
-        return 0;
-    return GetLastError();
+    windesk_scope d = windesk_enter();
+    DWORD err = SetCursorPos(x, y) ? 0 : GetLastError();
+    windesk_leave(d);
+    return err;
 }
-static DWORD input_send(DWORD flags, DWORD data, WORD scan, int keyboard) {
+static DWORD input_send_here(DWORD flags, DWORD data, WORD scan, int keyboard) {
     INPUT in = {0};
     if (keyboard) {
         in.type = INPUT_KEYBOARD;
@@ -33,7 +39,17 @@ static DWORD input_send(DWORD flags, DWORD data, WORD scan, int keyboard) {
     DWORD err = GetLastError();
     return err ? err : ERROR_ACCESS_DENIED;
 }
+static DWORD input_send(DWORD flags, DWORD data, WORD scan, int keyboard) {
+    windesk_scope d = windesk_enter();
+    DWORD err = input_send_here(flags, data, scan, keyboard);
+    windesk_leave(d);
+    return err;
+}
 static DWORD input_focus(uint64_t id) {
+    // While a secure desktop (UAC, lock screen) has the input, raising the
+    // streamed window would only steal focus from that prompt.
+    if (!windesk_input_is_default())
+        return 0;
     HWND hwnd = (HWND)(uintptr_t)id;
     if (!IsWindow(hwnd))
         return ERROR_INVALID_WINDOW_HANDLE;

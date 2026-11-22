@@ -1,6 +1,7 @@
 #define COBJMACROS
 #define WIN32_LEAN_AND_MEAN
 #include "native_windows.h"
+#include "windesk.h"
 #include "wgc_windows.h"
 #include <d3d10.h>
 #include <d3d11.h>
@@ -610,7 +611,14 @@ static HRESULT texture_frame(capture_native *s, ID3D11Texture2D *texture, const 
 static HRESULT composite_frame(capture_native *s, unsigned int timeout_ms);
 static long frame(capture_native *s, capture_image *image, unsigned int timeout_ms);
 long capture_frame(capture_native *s, capture_image *image, unsigned int timeout_ms) {
+    // DuplicateOutput and GDI only see the calling thread's desktop. Joining
+    // the input desktop for each frame means a switch to Winlogon (UAC's
+    // secure prompt, the lock screen) shows up as ACCESS_LOST, and the
+    // re-init below then duplicates Winlogon; switching back does the same
+    // for Default. Opening Winlogon needs SYSTEM (see windesk.h).
+    windesk_scope d = windesk_enter();
     long hr = frame(s, image, timeout_ms);
+    windesk_leave(d);
     image->present = s->present;
     return hr;
 }

@@ -1,6 +1,7 @@
 package capture
 
 /*
+#cgo windows CFLAGS: -I${SRCDIR}/../windesk
 #cgo windows LDFLAGS: -ld3d11 -ldxgi -ldxguid -ldwmapi -lgdi32 -luser32 -lruntimeobject -lole32 -static-libgcc -static-libstdc++
 #include "native_windows.h"
 */
